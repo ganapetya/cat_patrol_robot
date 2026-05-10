@@ -1,0 +1,50 @@
+# cat_patrol_robot — topic map and defaults (ROS 2 Humble / Yahboom)
+# Matches yahboomcar_bringup Mcnamu_driver_X3 and typical Astra camera topics.
+
+/**:
+  ros__parameters:
+    # Command motion to driver
+    cmd_vel_topic: "/cmd_vel"
+    # RGB camera (yahboomcar_astra / Orbbec)
+    image_topic: "/camera/color/image_raw"
+    # LiDAR (when connected)
+    scan_topic: "/scan"
+    # Driver buzzer (onboard beep — not a bark audio file)
+    buzzer_topic: "Buzzer"
+    # Optional safety: manual takeover via joy stack
+    joy_active_topic: "/JoyState"
+    # TF frames for odom-relative patrol and return-home
+    odom_frame: "odom"
+    base_frame: "base_footprint"
+    # Where JPEGs are saved before mailing
+    image_save_dir: "/tmp/cat_patrol_images"
+    use_lidar_obstacle_stop: false
+    obstacle_min_range_m: 0.35
+    obstacle_sector_deg: 60.0
+    linear_speed: 0.2
+    angular_speed: 0.6
+    patrol_drive_sec: 2.0
+    patrol_timer_period_ms: 50
+    capture_frame_count: 12
+    capture_turn_speed: 3.0
+    capture_rotate_sec: 0.3
+    return_home_max_time_sec: 120.0
+    position_tolerance_m: 0.15
+    yaw_tolerance_rad: 0.2
+    # Periodic patrol interval for the long-running patrol_node (30 minutes).
+    patrol_period_sec: 180.0
+    # If true, rclcpp::shutdown() after first return-home (for custom one-shot wrappers;
+    # avoid systemd timers that relaunch full bringup — that would start a second robot stack).
+    exit_after_one_cycle: false
+    start_patrol_on_boot: true
+    loop_patrol: true
+    use_joy_override: false
+    # Mail: JSON published on mail_request_topic, handled by mail_node.py
+    mail_request_topic: "/cat_patrol/mail_request"
+    mail_subject: "Cat patrol photos"
+    smtp_to_address: "peter.botnet@gmail.com"
+    # Advanced
+    cat_detection_enabled: false
+    cat_detected_topic: "/cat_patrol/cat_detected"
+    approach_linear_speed: 0.1
+    approach_max_sec: 15.0
