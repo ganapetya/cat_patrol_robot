@@ -19,7 +19,11 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
-add_executable(patrol_node src/patrol_node.cpp)
+add_executable(patrol_node
+  src/patrol_node.cpp
+  src/patterns/classic_pattern.cpp
+  src/patterns/till_obstacle_back_pattern.cpp
+)
 target_include_directories(patrol_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

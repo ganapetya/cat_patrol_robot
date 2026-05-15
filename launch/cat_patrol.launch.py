@@ -1,16 +1,16 @@
-"""Bring up Yahboom base + patrol + mail.
+"""Bring up Yahboom base + Astra camera + patrol + mail.
 
 Robot variant: ``robot`` = x3 / r2 / none (drivers skipped for ``none``).
 With ``robot:=none``, ``patrol_node`` stays idle unless you publish odom /
 start patrol manually — no TF spam from a phantom robot.
-Camera is not launched here — start your camera separately if needed.
+Camera (astra_camera) is launched automatically with depth + color enabled.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.launch_description_sources import PythonLaunchDescriptionSource, AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -18,6 +18,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_cat = get_package_share_directory('cat_patrol_robot')
     pkg_bringup = get_package_share_directory('yahboomcar_bringup')
+    pkg_astra = get_package_share_directory('astra_camera')
     params_file = os.path.join(pkg_cat, 'config', 'cat_patrol_params.yaml')
 
     robot_arg = DeclareLaunchArgument(
@@ -34,6 +35,12 @@ def generate_launch_description():
         description='X3 only: USB device for Rosmaster (see yahboomcar_bringup_X3_launch)',
     )
 
+    uvc_product_id_arg = DeclareLaunchArgument(
+        'uvc_product_id',
+        default_value='0x050f',
+        description='Astra camera UVC product ID',
+    )
+
     def compose(context):  # noqa: D401
         """OpaqueFunction: resolved robot string → correct bringup + patrol params."""
 
@@ -41,6 +48,16 @@ def generate_launch_description():
 
         robot = LaunchConfiguration('robot').perform(context)
         robot = robot.strip().lower()
+
+        # --- Astra camera (always launched) ---
+        entities.append(
+            IncludeLaunchDescription(
+                AnyLaunchDescriptionSource(
+                    os.path.join(pkg_astra, 'launch', 'astra_pro.launch.xml')),
+                launch_arguments=[
+                    ('uvc_product_id', LaunchConfiguration('uvc_product_id')),
+                ],
+            ))
 
         if robot == 'x3':
             entities.append(
@@ -94,5 +111,6 @@ def generate_launch_description():
         robot_arg,
         use_sim_arg,
         chassis_serial_arg,
+        uvc_product_id_arg,
         OpaqueFunction(function=compose),
     ])

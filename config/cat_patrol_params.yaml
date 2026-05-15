@@ -21,6 +21,14 @@
     use_lidar_obstacle_stop: false
     obstacle_min_range_m: 0.35
     obstacle_sector_deg: 60.0
+    # Depth-camera obstacle detection (Astra depth stream, no LiDAR needed)
+    depth_image_topic: "/camera/depth/image_raw"
+    depth_obstacle_min_m: 0.50
+    depth_sector_width_ratio: 0.33
+    # Patrol pattern: "classic" (fwd/back/fwd/back) or "till_obstacle_back_images_turn"
+    patrol_pattern: "till_obstacle_back_images_turn"
+    forward_timeout_sec: 60.0
+    drive_back_timeout_sec: 60.0
     linear_speed: 0.2
     angular_speed: 0.6
     patrol_drive_sec: 2.0
@@ -31,7 +39,7 @@
     return_home_max_time_sec: 120.0
     position_tolerance_m: 0.15
     yaw_tolerance_rad: 0.2
-    # Periodic patrol interval for the long-running patrol_node (30 minutes).
+    # Periodic patrol interval (180s = 3 min for testing; production: 1800)
     patrol_period_sec: 180.0
     # If true, rclcpp::shutdown() after first return-home (for custom one-shot wrappers;
     # avoid systemd timers that relaunch full bringup — that would start a second robot stack).

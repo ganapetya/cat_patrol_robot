@@ -17,6 +17,8 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 
+#include "cat_patrol_robot/patterns/patrol_pattern.hpp"
+
 namespace cat_patrol_robot
 {
 
@@ -38,6 +40,7 @@ public:
 private:
   void patrol_timer_cb();
   void image_cb(const sensor_msgs::msg::Image::SharedPtr msg);
+  void depth_image_cb(const sensor_msgs::msg::Image::SharedPtr msg);
   void scan_cb(const sensor_msgs::msg::LaserScan::SharedPtr msg);
   void joy_cb(const std_msgs::msg::Bool::SharedPtr msg);
   void cat_detected_cb(const std_msgs::msg::Bool::SharedPtr msg);
@@ -47,6 +50,7 @@ private:
   void publish_twist(double lin_x, double lin_y, double ang_z);
   void stop_robot();
   bool obstacle_too_close();
+  bool depth_obstacle_ahead();
 
   void patrol_tick();
 
@@ -56,12 +60,17 @@ private:
 
   bool save_current_image();
   void send_mail_request();
+  void set_buzzer(bool on);
   std::string escape_json(const std::string & s) const;
   void reset_idle_loop();
+
+  PatrolContext build_patrol_context();
+  void create_active_pattern();
 
   // Parameters / topics
   std::string cmd_vel_topic_;
   std::string image_topic_;
+  std::string depth_image_topic_;
   std::string scan_topic_;
   std::string buzzer_topic_;
   std::string joy_topic_;
@@ -72,10 +81,15 @@ private:
   std::string mail_subject_;
   std::string mail_to_;
   std::string cat_detected_topic_;
+  std::string patrol_pattern_name_;
 
   bool use_lidar_{false};
   double obstacle_min_range_{0.35};
   double obstacle_sector_deg_{60.0};
+  double depth_obstacle_min_m_{0.50};
+  double depth_sector_width_ratio_{0.33};
+  double forward_timeout_sec_{60.0};
+  double drive_back_timeout_sec_{60.0};
   double linear_speed_{0.2};
   double angular_speed_{0.6};
   double patrol_drive_sec_{10.0};
@@ -107,8 +121,9 @@ private:
   enum class CapturePhase { Snap, Rotate, Settle };
   CapturePhase capture_phase_{CapturePhase::Snap};
 
-  // Cat / laser / joy
+  // Cat / laser / depth / joy
   std::atomic<float> min_scan_range_{1000.0f};
+  std::atomic<float> min_depth_range_{1000.0f};
   std::atomic_bool joy_active_{false};
   std::atomic_bool cat_detected_{false};
 
@@ -119,17 +134,22 @@ private:
   rclcpp::Time state_enter_time_;
   rclcpp::TimerBase::SharedPtr patrol_timer_;
   rclcpp::TimerBase::SharedPtr idle_cycle_timer_;
+  rclcpp::TimerBase::SharedPtr heartbeat_timer_;
+  rclcpp::TimerBase::SharedPtr heartbeat_off_timer_;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr buzzer_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mail_pub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_image_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr joy_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr cat_sub_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+  std::unique_ptr<PatrolPattern> active_pattern_;
 };
 
 }  // namespace cat_patrol_robot
