@@ -156,6 +156,9 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   mail_to_ = declare_parameter<std::string>("smtp_to_address", "user@example.com");
   // Topic where an external cat-detection node publishes true/false.
   cat_detected_topic_ = declare_parameter<std::string>("cat_detected_topic", "/cat_patrol/cat_detected");
+  // Battery voltage topic (published by Mcnamu_driver_X3 as Float32 on "voltage")
+  voltage_topic_ = declare_parameter<std::string>("voltage_topic", "voltage");
+  low_voltage_warn_v_ = declare_parameter<double>("low_voltage_warn_v", 11.0);
 
   // --- Behavior toggles and numeric tuning ---
   use_lidar_ = declare_parameter<bool>("use_lidar_obstacle_stop", false);
@@ -166,11 +169,17 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   depth_image_topic_ = declare_parameter<std::string>("depth_image_topic", "/camera/depth/image_raw");
   depth_obstacle_min_m_ = declare_parameter<double>("depth_obstacle_min_m", 0.50);
   depth_sector_width_ratio_ = declare_parameter<double>("depth_sector_width_ratio", 0.33);
+  // Max acceptable age (sec) of a depth frame before we treat depth as DEAD
+  // and fail-safe by reporting an obstacle (so the robot stops moving forward).
+  depth_max_age_sec_ = declare_parameter<double>("depth_max_age_sec", 1.5);
 
   // Patrol pattern selection: "classic" or "till_obstacle_back_images_turn"
   patrol_pattern_name_ = declare_parameter<std::string>("patrol_pattern", "classic");
   forward_timeout_sec_ = declare_parameter<double>("forward_timeout_sec", 60.0);
   drive_back_timeout_sec_ = declare_parameter<double>("drive_back_timeout_sec", 60.0);
+  pattern_log_buffer_period_sec_ = declare_parameter<double>("pattern_log_buffer_period_sec", 60.0);
+  pattern_log_file_path_ = declare_parameter<std::string>(
+    "pattern_log_file_path", "/tmp/cat_patrol_pattern.log");
 
   // Forward/backward driving speed during patrol (meters per second).
   linear_speed_ = declare_parameter<double>("linear_speed", 0.2);
@@ -185,6 +194,15 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   capture_turn_speed_ = declare_parameter<double>("capture_turn_speed", 3.0);
   // How long to spin between each photo (seconds).
   capture_rotate_sec_ = declare_parameter<double>("capture_rotate_sec", 3.0);
+
+  // Proportional gain for the yaw P-controller during capture rotation.
+  capture_kp_ = declare_parameter<double>("capture_kp", 2.0);
+  // Minimum angular speed to prevent motor stall during capture rotation.
+  capture_min_angular_speed_ = declare_parameter<double>("capture_min_angular_speed", 0.15);
+  // Yaw tolerance for "close enough" during capture rotation (rad).
+  capture_yaw_tolerance_ = declare_parameter<double>("capture_yaw_tolerance", 0.10);
+  // Extra angle added to final capture closure before completion beep.
+  capture_completion_extra_deg_ = declare_parameter<double>("capture_completion_extra_deg", 0.0);
 
   // Maximum time allowed to drive home before giving up (seconds).
   return_timeout_sec_ = declare_parameter<double>("return_home_max_time_sec", 120.0);
@@ -301,6 +319,11 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   cat_sub_ = create_subscription<std_msgs::msg::Bool>(
     cat_detected_topic_, 10, std::bind(&PatrolNode::cat_detected_cb, this, std::placeholders::_1));
 
+  // Battery voltage subscriber (driver publishes ~10 Hz). Used to surface
+  // gradual turn degradation that is actually caused by low battery.
+  voltage_sub_ = create_subscription<std_msgs::msg::Float32>(
+    voltage_topic_, 10, std::bind(&PatrolNode::voltage_cb, this, std::placeholders::_1));
+
   // =========================================================================
   // STEP 5: Set up the TF (Transform) system
   // =========================================================================
@@ -356,7 +379,9 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
       std::chrono::duration<double>(std::max(1.0, patrol_period_sec_)),
       [this]() {
         if (state_ == PatrolState::Idle) {
-          RCLCPP_INFO(get_logger(), "Patrol period elapsed — starting cycle");
+          RCLCPP_INFO(get_logger(),
+            "Patrol period elapsed — starting cycle (battery=%.2f V)",
+            static_cast<double>(last_voltage_v_.load()));
           transition_to(PatrolState::Patrol);
         }
       });
@@ -381,6 +406,55 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   // STEP 9: Create the active patrol pattern
   // =========================================================================
   create_active_pattern();
+
+  // Loud effective-config banner so the operator can VERIFY which YAML/values
+  // are actually in effect this run (avoid source-vs-install confusion).
+  RCLCPP_INFO(get_logger(),
+    "==================== EFFECTIVE PATROL CONFIG ====================");
+  RCLCPP_INFO(get_logger(),
+    "  patrol_pattern             = %s", patrol_pattern_name_.c_str());
+  RCLCPP_INFO(get_logger(),
+    "  linear_speed               = %.3f m/s", linear_speed_);
+  RCLCPP_INFO(get_logger(),
+    "  angular_speed              = %.3f rad/s", angular_speed_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_frame_count        = %d", capture_frame_count_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_turn_speed         = %.3f rad/s", capture_turn_speed_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_kp                 = %.3f", capture_kp_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_min_angular_speed  = %.3f rad/s", capture_min_angular_speed_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_yaw_tolerance      = %.3f rad", capture_yaw_tolerance_);
+  RCLCPP_INFO(get_logger(),
+    "  capture_completion_extra_deg = %.3f deg", capture_completion_extra_deg_);
+  RCLCPP_INFO(get_logger(),
+    "  forward_timeout_sec        = %.1f", forward_timeout_sec_);
+  RCLCPP_INFO(get_logger(),
+    "  drive_back_timeout_sec     = %.1f", drive_back_timeout_sec_);
+  RCLCPP_INFO(get_logger(),
+    "  depth_image_topic          = %s", depth_image_topic_.c_str());
+  RCLCPP_INFO(get_logger(),
+    "  depth_obstacle_min_m       = %.2f", depth_obstacle_min_m_);
+  RCLCPP_INFO(get_logger(),
+    "  depth_max_age_sec          = %.2f (safe-stop if depth older than this)",
+    depth_max_age_sec_);
+  RCLCPP_INFO(get_logger(),
+    "  voltage_topic              = %s", voltage_topic_.c_str());
+  RCLCPP_INFO(get_logger(),
+    "  low_voltage_warn_v         = %.2f V", low_voltage_warn_v_);
+  RCLCPP_INFO(get_logger(),
+    "  pattern_log_file_path      = %s", pattern_log_file_path_.c_str());
+  RCLCPP_INFO(get_logger(),
+    "================================================================");
+
+  // Safety shutdown hook: ensure the chassis is commanded to stop when ROS
+  // is shutting down (e.g., Ctrl+C in launch terminal).
+  rclcpp::on_shutdown([this]() {
+    stop_robot();
+    set_buzzer(false);
+  });
 
   // =========================================================================
   // STEP 9: Pick the initial state
@@ -431,8 +505,10 @@ void PatrolNode::transition_to(PatrolState s)
     cat_detected_.store(false);
 
     if (get_odom_pose(home_x_, home_y_, home_yaw_)) {
-      RCLCPP_INFO(get_logger(), "Recorded home (odom): x=%.3f y=%.3f yaw=%.3f",
-                  home_x_, home_y_, home_yaw_);
+      RCLCPP_INFO(get_logger(),
+        "Recorded home (odom): x=%.3f y=%.3f yaw=%.3f | battery=%.2f V",
+        home_x_, home_y_, home_yaw_,
+        static_cast<double>(last_voltage_v_.load()));
     } else {
       RCLCPP_WARN(get_logger(), "Could not read odom pose at patrol start — return-home may fail");
     }
@@ -674,6 +750,26 @@ void PatrolNode::cat_detected_cb(const std_msgs::msg::Bool::SharedPtr msg)
 }
 
 // ===========================================================================
+// voltage_cb — store battery voltage; warn on low voltage (throttled)
+// ===========================================================================
+// WHY:  Yahboom X3 motor torque/speed drops with battery voltage. As the
+//       pack drains, wheels slip more during in-place rotation, so the
+//       robot physically rotates less than odometry/IMU report. This shows
+//       up as "circle gets shorter over time" / "turn-around degrades".
+// ===========================================================================
+void PatrolNode::voltage_cb(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  const float v = msg->data;
+  last_voltage_v_.store(v);
+  if (v > 0.1f && v < static_cast<float>(low_voltage_warn_v_)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 15000,
+      "Low battery voltage: %.2f V (< %.2f V). "
+      "Motor torque is reduced; rotations/turn-arounds will physically fall short of odometry.",
+      v, low_voltage_warn_v_);
+  }
+}
+
+// ===========================================================================
 // image_cb — camera image callback
 // ===========================================================================
 // WHEN:  Called every time a new camera frame arrives (e.g., 30 fps).
@@ -703,6 +799,10 @@ void PatrolNode::depth_image_cb(const sensor_msgs::msg::Image::SharedPtr msg)
   if (!msg || msg->data.empty() || msg->width == 0 || msg->height == 0) {
     return;
   }
+
+  // Record when we last received a valid depth frame so the freshness
+  // watchdog in depth_obstacle_ahead() can detect a dead camera node.
+  last_depth_msg_secs_.store(now().seconds());
 
   const int rows = static_cast<int>(msg->height);
   const int cols = static_cast<int>(msg->width);
@@ -740,6 +840,23 @@ void PatrolNode::depth_image_cb(const sensor_msgs::msg::Image::SharedPtr msg)
 
 bool PatrolNode::depth_obstacle_ahead()
 {
+  // SAFETY: if no depth frame has been received recently (camera dead /
+  // node not running), treat as obstacle so the robot does NOT drive blindly.
+  const double last_s = last_depth_msg_secs_.load();
+  const double now_s = now().seconds();
+  if (last_s <= 0.0) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "Depth camera: no frames received yet on '%s' — treating as obstacle (safe stop)",
+      depth_image_topic_.c_str());
+    return true;
+  }
+  const double age = now_s - last_s;
+  if (age > depth_max_age_sec_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "Depth camera stale: last frame %.1fs ago (> %.1fs) on '%s' — safe stop",
+      age, depth_max_age_sec_, depth_image_topic_.c_str());
+    return true;
+  }
   return min_depth_range_.load() < static_cast<float>(depth_obstacle_min_m_);
 }
 
@@ -752,6 +869,9 @@ void PatrolNode::create_active_pattern()
     auto p = std::make_unique<TillObstacleBackPattern>();
     p->forward_timeout_sec = forward_timeout_sec_;
     p->drive_back_timeout_sec = drive_back_timeout_sec_;
+    p->capture_completion_extra_deg = capture_completion_extra_deg_;
+    p->log_buffer_period_sec = pattern_log_buffer_period_sec_;
+    p->log_file_path = pattern_log_file_path_;
     active_pattern_ = std::move(p);
   } else {
     active_pattern_ = std::make_unique<ClassicPattern>();
@@ -777,6 +897,7 @@ PatrolContext PatrolNode::build_patrol_context()
   ctx.set_buzzer = [this](bool on) { set_buzzer(on); };
   ctx.now = [this]() { return now(); };
   ctx.get_logger = [this]() { return get_logger(); };
+  ctx.clock = get_clock();
 
   ctx.home_x = home_x_;
   ctx.home_y = home_y_;
@@ -789,6 +910,9 @@ PatrolContext PatrolNode::build_patrol_context()
   ctx.capture_frame_count = capture_frame_count_;
   ctx.capture_turn_speed = capture_turn_speed_;
   ctx.capture_rotate_sec = capture_rotate_sec_;
+  ctx.capture_kp = capture_kp_;
+  ctx.capture_min_angular_speed = capture_min_angular_speed_;
+  ctx.capture_yaw_tolerance = capture_yaw_tolerance_;
   return ctx;
 }
 
@@ -893,13 +1017,22 @@ void PatrolNode::patrol_timer_cb()
   // and cleaner.  It jumps directly to the matching "case".
   switch (state_) {
     case PatrolState::WaitingForTf: {
-      // Try to read the robot's pose.  If it works, TF is ready — start!
+      // Wait at least 5 seconds before accepting TF.  The chassis driver
+      // (Mcnamu_driver_X3) needs time to open the serial port and start
+      // publishing fresh odom.  Without this delay the TF buffer may
+      // return a STALE transform from a previous run, causing the node
+      // to record a wrong home position.
+      const double waited = (now() - state_enter_time_).seconds();
+      if (waited < 5.0) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Waiting for drivers to start (%.0f/5s)...", waited);
+        break;
+      }
       double x, y, yaw;
       if (get_odom_pose(x, y, yaw)) {
         RCLCPP_INFO(get_logger(), "TF available — starting patrol");
         transition_to(PatrolState::Patrol);
       }
-      // If it fails, we just wait and try again on the next tick.
       break;
     }
     case PatrolState::Idle:
@@ -1277,8 +1410,8 @@ void PatrolNode::return_home_tick()
 
   // Proportional angular velocity: turn faster when the error is large,
   // slower when nearly aligned.  "clamp" limits the value to [-angular_speed_, +angular_speed_].
-  // The "* 2.0" is a proportional gain — makes turning more responsive.
-  double w = std::clamp(turn * 2.0, -angular_speed_, angular_speed_);
+  // capture_kp_ is the proportional gain — makes turning more responsive.
+  double w = std::clamp(turn * capture_kp_, -angular_speed_, angular_speed_);
 
   // Forward speed: drive at 70% of max speed (conservative to allow corrections).
   double v = std::clamp(linear_speed_ * 0.7, 0.0, linear_speed_);

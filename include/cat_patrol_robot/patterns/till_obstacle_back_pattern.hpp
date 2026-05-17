@@ -71,6 +71,9 @@ public:
   //   below are private — outside code shouldn't touch them.
   double forward_timeout_sec{60.0};      // Max seconds to drive forward
   double drive_back_timeout_sec{60.0};   // Max seconds to drive backward
+  double capture_completion_extra_deg{0.0};  // Extra final rotation before completion beep
+  double log_buffer_period_sec{60.0};    // Keep logs in-memory before flush
+  std::string log_file_path{"/tmp/cat_patrol_pattern.log"};  // Buffered log target file
 
 private:
   // =========================================================================
@@ -102,11 +105,15 @@ private:
   //   Snap:    save the current camera frame to a JPEG
   //   Rotate:  spin to the next yaw target (closed-loop via odometry)
   //   Settle:  wait 0.8s for camera image to stabilize after rotation
-  enum class CaptureStep { Snap, Rotate, Settle };
+  enum class CaptureStep { Snap, BeepSequence, Rotate, Settle };
   CaptureStep capture_step_{CaptureStep::Snap};
   rclcpp::Time capture_settle_end_;   // When the settle wait finishes
   int frames_saved_{0};               // How many photos saved so far
   std::vector<std::string> saved_paths_;  // File paths of saved JPEGs
+  int beep_remaining_{0};             // Pulses left in the current beep sequence
+  bool beep_is_on_{false};            // Current beep-sequence output state
+  bool completion_beep_pending_{false};  // True when finishing 360° after beeps
+  rclcpp::Time beep_toggle_deadline_; // Next beep sequence toggle time
 
   // =========================================================================
   // Closed-loop yaw tracking for precise 360° panoramic sweep
@@ -131,6 +138,14 @@ private:
   double capture_target_yaw_{0.0};    // Where we're currently rotating TO
   rclcpp::Time capture_rotate_start_; // When this rotation step began (timeout)
 
+  // Odometry noise filtering for yaw during capture rotation.
+  // The Yahboom Rosmaster serial link can drop/delay encoder updates,
+  // causing sudden yaw jumps of ~1 rad.  We reject readings that exceed
+  // the physically possible delta per tick.
+  double last_good_yaw_{0.0};         // Last accepted yaw reading
+  bool last_good_yaw_valid_{false};   // Have we recorded a reading yet?
+  int stuck_tick_count_{0};           // Ticks where yaw hasn't changed
+
   // Short buzzer beep on each capture — provides audible feedback
   bool capture_buzzer_on_{false};     // Is the beep currently active?
   rclcpp::Time buzzer_off_time_;      // When to turn it off (150ms after snap)
@@ -140,6 +155,11 @@ private:
   // =========================================================================
   double turn_target_yaw_{0.0};  // Target heading (start + π)
   bool turn_target_set_{false};  // Have we computed the target yet?
+
+  // Buffered file logging (phase-aware).
+  std::vector<std::string> buffered_logs_;
+  rclcpp::Time log_window_start_;
+  bool log_flush_pending_{false};
 
   // =========================================================================
   // Private methods — one per phase
@@ -153,6 +173,8 @@ private:
   PatrolSignal tick_drive_back_home(PatrolContext & ctx);
   PatrolSignal tick_capture(PatrolContext & ctx);
   PatrolSignal tick_turn_around(PatrolContext & ctx);
+  void append_buffered_log(PatrolContext & ctx, const std::string & message);
+  void maybe_flush_buffered_logs(PatrolContext & ctx, bool force);
 };
 
 }  // namespace cat_patrol_robot

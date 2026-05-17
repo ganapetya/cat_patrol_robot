@@ -156,6 +156,10 @@ struct PatrolContext
   // Get the ROS logger for this node (used with RCLCPP_INFO, RCLCPP_WARN, etc.)
   std::function<rclcpp::Logger()> get_logger;
 
+  // Shared clock — use for RCLCPP_*_THROTTLE macros instead of
+  // rclcpp::Clock::make_shared() which heap-allocates every call.
+  rclcpp::Clock::SharedPtr clock;
+
   // --- Data from the node (read-only values set before each tick) ---
 
   // Home position recorded at patrol start (odometry frame).
@@ -175,6 +179,11 @@ struct PatrolContext
   int capture_frame_count{12};    // How many photos in the 360° sweep
   double capture_turn_speed{3.0}; // Max rotation speed during capture (rad/s)
   double capture_rotate_sec{3.0}; // (Legacy) timed rotation duration per step
+
+  // Closed-loop rotation tuning (capture P-controller)
+  double capture_kp{2.0};                 // Proportional gain for yaw error
+  double capture_min_angular_speed{0.15}; // Floor speed to prevent motor stall (rad/s)
+  double capture_yaw_tolerance{0.10};     // "Close enough" yaw threshold (rad)
 };
 
 // ===========================================================================

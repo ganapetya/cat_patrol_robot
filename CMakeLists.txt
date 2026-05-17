@@ -38,6 +38,7 @@ install(PROGRAMS
   scripts/run_cat_patrol.sh
   scripts/play_bark.sh
   scripts/mail_node
+  scripts/check_active_config.sh
   DESTINATION lib/${PROJECT_NAME})
 
 ament_python_install_package(${PROJECT_NAME})
