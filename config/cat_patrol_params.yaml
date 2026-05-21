@@ -106,7 +106,10 @@
     # =========================================================================
 
     # LiDAR obstacle stopping (requires a LiDAR sensor connected)
-    use_lidar_obstacle_stop: false
+    # The sllidar_ros2 driver is started by cat_patrol.launch.py (start_lidar:=auto),
+    # so /scan is available.  Setting this true wires patrol_node to subscribe and
+    # adds LiDAR as a second safety check alongside the depth-camera stop.
+    use_lidar_obstacle_stop: true
     obstacle_min_range_m: 0.35       # Stop if LiDAR sees something closer (meters)
     obstacle_sector_deg: 60.0        # Front cone width to monitor (degrees)
 
@@ -148,7 +151,7 @@
     # Timeouts for the till_obstacle_back pattern
     forward_timeout_sec: 60.0        # Max seconds driving forward
     drive_back_timeout_sec: 60.0     # Max seconds driving backward
-    odom_angular_scale: 0.51         # Passed to base_node_X3 angular_scale for yaw calibration
+    odom_angular_scale: 0.95         # Passed to base_node_X3 angular_scale for yaw calibration
                                      # (at scale=0.54 physical≈340° => 0.54*340/360≈0.51 to reach physical 360°)
     pattern_log_buffer_period_sec: 60.0   # Keep pattern logs in RAM before flush
     pattern_log_file_path: "/tmp/cat_patrol_pattern.log"  # Buffered pattern log file
@@ -157,7 +160,7 @@
     # MOTION PARAMETERS
     # =========================================================================
     linear_speed: 0.2                # Forward/backward speed (m/s)
-    angular_speed: 0.8               # Turning speed (rad/s)
+    angular_speed: 0.5               # Turning speed (rad/s)
     patrol_drive_sec: 2.0            # Duration per leg (classic pattern only)
 
     # Main control loop frequency: 50 ms = 20 Hz.
@@ -263,7 +266,7 @@
     # =========================================================================
     return_home_max_time_sec: 120.0  # Give up after 2 minutes
     position_tolerance_m: 0.15       # "Close enough" to home (15 cm)
-    yaw_tolerance_rad: 0.2           # "Close enough" heading (≈11 degrees)
+    yaw_tolerance_rad: 0.05           # "Close enough" heading (≈11 degrees)
 
     # =========================================================================
     # PATROL CYCLE TIMING

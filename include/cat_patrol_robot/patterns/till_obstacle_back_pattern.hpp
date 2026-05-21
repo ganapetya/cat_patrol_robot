@@ -153,8 +153,21 @@ private:
   // =========================================================================
   // Turn-around tracking (Phase 4)
   // =========================================================================
-  double turn_target_yaw_{0.0};  // Target heading (start + π)
-  bool turn_target_set_{false};  // Have we computed the target yet?
+  // The final 180° rotation is broken into N small step rotations using the
+  // SAME motion profile as the capture sweep (step_angle = 2π / N_frames).
+  // This matters because mecanum chassis slip differs between sustained
+  // rotation and brief start/stop bursts — by replicating the capture's
+  // many-short-bursts pattern, the two rotations share an odometry-to-
+  // physical ratio, so a single odom_angular_scale calibrates both.
+  enum class TurnStep { Rotate, Settle };
+  double turn_start_yaw_{0.0};           // Yaw when turn-around began
+  double turn_target_yaw_{0.0};          // Current step's absolute target yaw
+  int    turn_steps_total_{6};           // How many step rotations to cover 180°
+  int    turn_steps_done_{0};            // How many step rotations completed
+  TurnStep turn_step_{TurnStep::Rotate}; // Current sub-state
+  rclcpp::Time turn_settle_end_;         // When the inter-step settle finishes
+  rclcpp::Time turn_step_start_;         // When the current step's rotation began (timeout)
+  bool turn_target_set_{false};          // Have we initialized the turn-around sequence?
 
   // Buffered file logging (phase-aware).
   std::vector<std::string> buffered_logs_;

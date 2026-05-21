@@ -611,68 +611,198 @@ PatrolSignal TillObstacleBackPattern::tick_capture(PatrolContext & ctx)
 }
 
 // ===========================================================================
-// Phase 4: TurnAround — rotate 180° and finish
+// Phase 4: TurnAround — rotate 180° using the SAME motion profile as capture
 // ===========================================================================
 // After all photos are taken and emailed, the robot faces roughly the same
 // direction as when capture started (because we did a full 360°).  We turn
 // 180° so the robot faces the OPPOSITE direction — ready for the next patrol
 // cycle to drive forward into new territory.
 //
-// MATH: "normalize_angle(yaw + M_PI)" adds 180° (π radians) to the current
-// heading and wraps to (-π, +π].  This is the target heading.
+// WHY STEP-BASED (and not one big rotation):
+//   Mecanum chassis show much higher wheel slip during SUSTAINED rotation
+//   than during repeated short rotations.  The capture sweep does 12 × 30°
+//   bursts with a settle between each — that motion profile happens to give
+//   odom-to-physical ≈ 1:1 (after calibrating odom_angular_scale).  A single
+//   uninterrupted 180° rotation under the SAME controller gave only ~100°
+//   physical because the rollers keep skidding once steady-state spin is
+//   reached.  The fix: replicate the capture's many-short-bursts profile.
 //
-// The error (target - current) is fed into a simple bang-bang controller:
-//   std::copysign(angular_speed, error)
-// This turns at full speed in the correct direction until the error is
-// within yaw_tol (0.2 rad ≈ 11°).  Less precise than proportional control
-// but fine for a 180° turn where overshoot is acceptable.
+// STRATEGY:
+//   - step_angle = 2π / capture_frame_count   (e.g. 30° for 12 frames)
+//   - turn_steps_total = round(π / step_angle) (e.g. 6 steps for 30° each)
+//   - Each step uses the SAME P-controller, min-speed floor, outlier
+//     rejection, and stuck detection as tick_capture.
+//   - Absolute targets anchored to turn_start_yaw_ prevent accumulated
+//     per-step undershoot (same trick the capture loop uses).
+//   - Short 0.3s settle between steps (no photo to wait for, but the
+//     start/stop cadence is what reduces slip).
 // ===========================================================================
 PatrolSignal TillObstacleBackPattern::tick_turn_around(PatrolContext & ctx)
 {
+  const auto tnow = ctx.now();
+
   double x, y, yaw;
   if (!ctx.get_odom_pose(x, y, yaw)) {
     ctx.stop_robot();
     return PatrolSignal::Continue;
   }
 
-  // On the first tick of this phase, compute the target heading (once).
-  // "turn_target_set_" prevents recomputing it every tick.
+  // step_angle matches the capture sweep so step dynamics are identical
+  const double step_angle = 2.0 * M_PI / ctx.capture_frame_count;
+  const double settle_sec = 0.3;
+  const double per_step_timeout = 15.0;
+
+  // --- First-tick setup ---
   if (!turn_target_set_) {
-    turn_target_yaw_ = normalize_angle(yaw + M_PI);  // Current heading + 180°
+    turn_start_yaw_ = yaw;
+    turn_steps_total_ = std::max(1,
+      static_cast<int>(std::round(M_PI / step_angle)));
+    turn_steps_done_ = 0;
+    turn_step_ = TurnStep::Rotate;
+    turn_target_yaw_ = normalize_angle(turn_start_yaw_ + step_angle);
+    turn_step_start_ = tnow;
     turn_target_set_ = true;
+    last_good_yaw_ = yaw;
+    last_good_yaw_valid_ = true;
+    stuck_tick_count_ = 0;
     RCLCPP_INFO(ctx.get_logger(),
-      "[till_obstacle_back] Turning 180° — target yaw=%.2f", turn_target_yaw_);
+      "[till_obstacle_back] Turning 180° via %d × %.1f° steps — first target=%.2f",
+      turn_steps_total_, step_angle * 180.0 / M_PI, turn_target_yaw_);
     append_buffered_log(ctx, "Turn-around started");
   }
 
-  // 30-second timeout: if the turn takes this long, something is stuck
-  const double elapsed = (ctx.now() - phase_start_).seconds();
-  if (elapsed > 30.0) {
-    RCLCPP_WARN(ctx.get_logger(), "[till_obstacle_back] Turn timeout");
+  // Phase-level timeout (raised from 30s — multi-step turn is slower)
+  const double elapsed = (tnow - phase_start_).seconds();
+  if (elapsed > 60.0) {
+    RCLCPP_WARN(ctx.get_logger(),
+      "[till_obstacle_back] Turn-around timeout after %.1fs (%d/%d steps done)",
+      elapsed, turn_steps_done_, turn_steps_total_);
     ctx.stop_robot();
     enter_phase(Phase::Done, ctx);
     append_buffered_log(ctx, "Turn-around timeout; forcing done");
     return PatrolSignal::Continue;
   }
 
-  const double err = normalize_angle(turn_target_yaw_ - yaw);
-  if (std::abs(err) < ctx.yaw_tol) {
-    // Close enough — done!
-    ctx.stop_robot();
-    RCLCPP_INFO(ctx.get_logger(), "[till_obstacle_back] Turn complete — pattern done");
-    enter_phase(Phase::Done, ctx);
-    append_buffered_log(ctx, "Turn-around complete");
-    maybe_flush_buffered_logs(ctx, true);
-    return PatrolSignal::DoneIdle;  // Tell the node: "I'm finished, go idle"
+  switch (turn_step_) {
+
+    // =====================================================================
+    // TurnStep::Rotate — spin toward the current step's target yaw
+    // =====================================================================
+    case TurnStep::Rotate: {
+      // Per-step timeout — skip the step rather than blocking forever.
+      const double step_elapsed = (tnow - turn_step_start_).seconds();
+      if (step_elapsed > per_step_timeout) {
+        RCLCPP_WARN(ctx.get_logger(),
+          "[till_obstacle_back] Turn step %d/%d timeout (%.0fs) — skipping",
+          turn_steps_done_ + 1, turn_steps_total_, step_elapsed);
+        ctx.stop_robot();
+        turn_step_ = TurnStep::Settle;
+        turn_settle_end_ = tnow + rclcpp::Duration::from_seconds(settle_sec);
+        break;
+      }
+
+      // --- Yaw outlier rejection (identical to tick_capture) ---
+      double yaw_delta = 0.0;
+      if (last_good_yaw_valid_) {
+        yaw_delta = std::abs(normalize_angle(yaw - last_good_yaw_));
+        const double max_delta = ctx.capture_turn_speed * 0.20;  // 4× a 50ms tick
+        if (yaw_delta > max_delta) {
+          RCLCPP_WARN_THROTTLE(ctx.get_logger(), *ctx.clock, 2000,
+            "[till_obstacle_back] Turn odom glitch rejected: yaw=%.3f last=%.3f delta=%.3f",
+            yaw, last_good_yaw_, yaw_delta);
+          append_buffered_log(ctx,
+            "Rejected turn yaw glitch delta=" + std::to_string(yaw_delta));
+          yaw = last_good_yaw_;
+          yaw_delta = 0.0;
+        }
+      }
+      last_good_yaw_ = yaw;
+      last_good_yaw_valid_ = true;
+
+      const double err = normalize_angle(turn_target_yaw_ - yaw);
+
+      RCLCPP_INFO_THROTTLE(ctx.get_logger(), *ctx.clock, 3000,
+        "[till_obstacle_back] TURN step %d/%d err=%.3f yaw=%.2f tgt=%.2f stuck=%d",
+        turn_steps_done_ + 1, turn_steps_total_, err, yaw, turn_target_yaw_,
+        stuck_tick_count_);
+
+      if (std::abs(err) < ctx.capture_yaw_tolerance) {
+        ctx.stop_robot();
+        turn_step_ = TurnStep::Settle;
+        turn_settle_end_ = tnow + rclcpp::Duration::from_seconds(settle_sec);
+        stuck_tick_count_ = 0;
+        RCLCPP_INFO(ctx.get_logger(),
+          "[till_obstacle_back] Turn step %d/%d reached (err=%.3f, %.1fs)",
+          turn_steps_done_ + 1, turn_steps_total_, err, step_elapsed);
+        break;
+      }
+
+      // --- P-controller (identical to tick_capture) ---
+      double w = std::clamp(err * ctx.capture_kp,
+        -ctx.capture_turn_speed, ctx.capture_turn_speed);
+      if (std::abs(w) < ctx.capture_min_angular_speed) {
+        w = std::copysign(ctx.capture_min_angular_speed, w);
+      }
+
+      // --- Stuck detection (identical to tick_capture) ---
+      if (yaw_delta < 0.005) {
+        stuck_tick_count_++;
+      } else {
+        stuck_tick_count_ = 0;
+      }
+      if (stuck_tick_count_ > 20) {  // ~1 second at 20 Hz
+        const double boosted = std::copysign(
+          std::min(std::abs(w) * 2.0, ctx.capture_turn_speed), w);
+        RCLCPP_WARN_THROTTLE(ctx.get_logger(), *ctx.clock, 5000,
+          "[till_obstacle_back] Turn step %d stuck (%d ticks) — boosting w %.2f→%.2f",
+          turn_steps_done_ + 1, stuck_tick_count_, w, boosted);
+        w = boosted;
+      }
+
+      ctx.publish_twist(0.0, 0.0, w);
+      break;
+    }
+
+    // =====================================================================
+    // TurnStep::Settle — short pause between step rotations
+    // =====================================================================
+    // The settle period is what makes this profile match the capture sweep
+    // (mecanum slip is much lower in start/stop bursts than in sustained
+    // rotation).  We don't need to wait for camera stabilization, just
+    // long enough to fully decelerate before the next burst.
+    case TurnStep::Settle: {
+      if (tnow < turn_settle_end_) {
+        break;
+      }
+
+      turn_steps_done_++;
+      if (turn_steps_done_ >= turn_steps_total_) {
+        RCLCPP_INFO(ctx.get_logger(),
+          "[till_obstacle_back] Turn complete — %d steps done, pattern done",
+          turn_steps_done_);
+        enter_phase(Phase::Done, ctx);
+        append_buffered_log(ctx, "Turn-around complete");
+        maybe_flush_buffered_logs(ctx, true);
+        return PatrolSignal::DoneIdle;
+      }
+
+      // Set next absolute target (anchored to turn_start_yaw_ to prevent
+      // per-step undershoot from accumulating across the 180°).
+      turn_target_yaw_ = normalize_angle(
+        turn_start_yaw_ + (turn_steps_done_ + 1) * step_angle);
+      turn_step_ = TurnStep::Rotate;
+      turn_step_start_ = tnow;
+      stuck_tick_count_ = 0;
+      // Re-prime outlier rejection so the new step starts from current yaw
+      last_good_yaw_ = yaw;
+      last_good_yaw_valid_ = true;
+      RCLCPP_INFO(ctx.get_logger(),
+        "[till_obstacle_back] Turn step %d/%d target=%.2f",
+        turn_steps_done_ + 1, turn_steps_total_, turn_target_yaw_);
+      break;
+    }
   }
 
-  // Use a proportional controller for smoother turn-in-place behavior.
-  double w = std::clamp(err * 1.8, -ctx.angular_speed, ctx.angular_speed);
-  const double min_w = std::min(0.20, std::max(0.05, ctx.angular_speed));
-  if (std::abs(w) < min_w) {
-    w = std::copysign(min_w, w);
-  }
-  ctx.publish_twist(0.0, 0.0, w);
   return PatrolSignal::Continue;
 }
 

@@ -15,19 +15,28 @@
 # WHAT THIS LAUNCH FILE STARTS:
 #   1. Astra camera node (color + depth streams)
 #   2. Yahboom chassis driver (motor control, odometry, TF)
-#   3. patrol_node (C++ — the robot's brain)
-#   4. mail_node (Python — sends email with photos)
+#   3. sllidar_ros2 driver (RPLidar /scan topic)  ← optional via start_lidar
+#   4. patrol_node (C++ — the robot's brain)
+#   5. mail_node (Python — sends email with photos)
 #
 # USAGE:
 #   ros2 launch cat_patrol_robot cat_patrol.launch.py
 #   ros2 launch cat_patrol_robot cat_patrol.launch.py robot:=none
 #   ros2 launch cat_patrol_robot cat_patrol.launch.py robot:=r2
+#   ros2 launch cat_patrol_robot cat_patrol.launch.py start_lidar:=false
+#   ros2 launch cat_patrol_robot cat_patrol.launch.py lidar_serial_port:=/dev/ttyUSB1
 #
 # ARGUMENTS:
 #   robot              — x3 (default), r2, or none (skip chassis driver)
 #   use_sim_time       — false (default); set true for Gazebo simulation
-#   chassis_serial_port — /dev/ttyUSB0 (X3 only, the Rosmaster board USB)
+#   chassis_serial_port — /dev/ttyUSB1 (verified Rosmaster CH340 1a86:7523).
+#                         Identified by raw stream containing 0x7B...0x7D frames.
 #   uvc_product_id     — 0x050f (Astra camera USB product ID)
+#   start_lidar        — auto (default): true unless robot:=none. true/false to force.
+#   lidar_serial_port  — by-id symlink for CP2102 → RPLidar A1 on /dev/ttyUSB0.
+#                        Using by-id makes this immune to USB enumeration order.
+#   lidar_baudrate     — 115200 (RPLidar A1 default).
+#   lidar_frame_id     — laser (TF frame published by the driver).
 # =============================================================================
 
 """Bring up Yahboom base + Astra camera + patrol + mail.
@@ -121,10 +130,33 @@ def generate_launch_description():
 
     use_sim_arg = DeclareLaunchArgument('use_sim_time', default_value='false')
 
+    # =========================================================================
+    # SERIAL PORT MAPPING for this Jetson (verified empirically on 2026-05-19):
+    #   /dev/ttyUSB0 -> RPLidar A1            (Silicon Labs CP2102, 10c4:ea60)
+    #     Stable by-id symlink:
+    #     /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+    #
+    #   /dev/ttyUSB1 -> Yahboom Rosmaster MCU (CH340 1a86:7523)
+    #     Identification: raw stream contains repeating 0x7B ... 0x7D frames
+    #     (Yahboom telemetry protocol). NO by-id symlink: this CH340 variant
+    #     doesn't expose a serial number, so it stays as /dev/ttyUSB1.
+    #
+    #   /dev/ttyUSB2 -> UNVERIFIED peripheral (CH340 1a86:7522)
+    #     Stable by-id symlink:
+    #     /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+    #     Observed: silent on idle (no continuous byte stream at 115200).
+    #     Possible candidates: Orbbec Astra Pro UART control endpoint,
+    #     joystick, IMU, or other peripheral. Not used by cat_patrol_robot —
+    #     identify via the unplug test if you need to know.
+    #
+    # Override these args at launch time if USB enumeration order shifts.
+    # =========================================================================
     chassis_serial_arg = DeclareLaunchArgument(
         'chassis_serial_port',
-        default_value='/dev/ttyUSB0',
-        description='X3 only: USB device for Rosmaster (see yahboomcar_bringup_X3_launch)',
+        default_value='/dev/ttyUSB1',
+        description='Yahboom Rosmaster MCU serial device. Verified by raw-byte sniff: '
+                    'the chassis port streams 0x7B...0x7D framed telemetry. '
+                    'No stable by-id symlink (CH340 1a86:7523 has no serial number).',
     )
 
     odom_angular_scale_arg = DeclareLaunchArgument(
@@ -137,6 +169,41 @@ def generate_launch_description():
         'uvc_product_id',
         default_value='0x050f',
         description='Astra camera UVC product ID',
+    )
+
+    # --- LiDAR arguments -----------------------------------------------------
+    # Use the by-id-stable port for the RPLidar.  We intentionally avoid
+    # /dev/rplidar because the current udev rule on this Jetson points it
+    # at the Yahboom chassis MCU (Silicon Labs CP210x, 10c4:ea60), which
+    # would clash with Mcnamu_driver_X3.  The actual LiDAR enumerates as
+    # /dev/ttyUSB2 (1a86 CH340) on this hardware.
+    start_lidar_arg = DeclareLaunchArgument(
+        'start_lidar',
+        default_value='auto',
+        description="Start sllidar_ros2 driver. 'true' / 'false' / 'auto' "
+                    "(auto = true unless robot:=none).",
+        choices=['true', 'false', 'auto'],
+    )
+    lidar_serial_port_arg = DeclareLaunchArgument(
+        'lidar_serial_port',
+        default_value=(
+            '/dev/serial/by-id/'
+            'usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'
+        ),
+        description='Serial device for the RPLidar A1. Uses the by-id symlink so '
+                    'USB enumeration order does not break the launch. Resolves to '
+                    '/dev/ttyUSB0 on this Jetson. (NOTE: do NOT use /dev/rplidar — '
+                    'that udev symlink races with hot-plug order.)',
+    )
+    lidar_baudrate_arg = DeclareLaunchArgument(
+        'lidar_baudrate',
+        default_value='115200',
+        description='RPLidar baudrate (115200 for A1 / A2-2.x, 256000 for A2-3.x / A3, 1000000 for S1).',
+    )
+    lidar_frame_id_arg = DeclareLaunchArgument(
+        'lidar_frame_id',
+        default_value='laser',
+        description='TF frame_id published by the LiDAR driver.',
     )
 
     # -----------------------------------------------------------------------
@@ -220,6 +287,46 @@ def generate_launch_description():
         # robot:=none → don't start patrolling (no TF, no motors)
         start_patrol = robot != 'none'
 
+        # --- LiDAR driver (sllidar_ros2 — publishes /scan) -------------------
+        # We resolve 'start_lidar' here so we can apply the "auto" default
+        # (auto → true unless robot:=none, where there's typically no robot
+        # hardware connected at all).
+        start_lidar_val = LaunchConfiguration('start_lidar').perform(context).strip().lower()
+        if start_lidar_val == 'auto':
+            start_lidar_resolved = (robot != 'none')
+        elif start_lidar_val == 'true':
+            start_lidar_resolved = True
+        elif start_lidar_val == 'false':
+            start_lidar_resolved = False
+        else:
+            raise RuntimeError(
+                'Invalid start_lidar=%r — use true / false / auto' % (start_lidar_val,))
+
+        if start_lidar_resolved:
+            try:
+                pkg_sllidar = get_package_share_directory('sllidar_ros2')
+            except Exception as ex:  # noqa: BLE001
+                raise RuntimeError(
+                    'start_lidar requested but sllidar_ros2 package not found. '
+                    'Either install it, source the overlay that contains it, '
+                    'or pass start_lidar:=false. (%s)' % (ex,))
+            entities.append(LogInfo(msg=(
+                f'[cat_patrol] Starting sllidar_ros2 driver on '
+                f'{LaunchConfiguration("lidar_serial_port").perform(context)} '
+                f'@ {LaunchConfiguration("lidar_baudrate").perform(context)} baud')))
+            entities.append(
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(pkg_sllidar, 'launch', 'sllidar_launch.py')),
+                    launch_arguments=[
+                        ('serial_port', LaunchConfiguration('lidar_serial_port')),
+                        ('serial_baudrate', LaunchConfiguration('lidar_baudrate')),
+                        ('frame_id', LaunchConfiguration('lidar_frame_id')),
+                    ],
+                ))
+        else:
+            entities.append(LogInfo(msg='[cat_patrol] LiDAR driver skipped (start_lidar=false)'))
+
         # --- Patrol node (C++, the robot's brain) ---
         # ROS 2 CONCEPT: PARAMETER MERGING
         #   The 'parameters' list can contain YAML files AND Python dicts.
@@ -268,5 +375,9 @@ def generate_launch_description():
         chassis_serial_arg,
         odom_angular_scale_arg,
         uvc_product_id_arg,
+        start_lidar_arg,
+        lidar_serial_port_arg,
+        lidar_baudrate_arg,
+        lidar_frame_id_arg,
         OpaqueFunction(function=compose),
     ])
