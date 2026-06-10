@@ -2,6 +2,32 @@
 
 ## Periodically walking, recognizing cats, barking on them
 
+## Spec:
+
+Yahboom ROSMASTER X3 chassis
+
+Jetson Orin NX as the compute module 
+
+RPLIDAR A1M8 lidar 
+
+Custom-built battery: 3S2P pack of Panasonic NCR18650B cells 
+
+Speaker working ("bark" feature), Bluetooth connectivity confirmed
+
+Standard ROSMASTER X3 platform specs:
+
+Mecanum wheels — 4-wheel omnidirectional drive, each with a 520 motor + encoder
+
+STM32-based expansion/driver board handling motor control, IMU, and power distribution, communicating with the Jetson over serial
+
+Onboard 9-axis IMU 
+
+Depth/RGB camera — the X3 
+
+OLED status display, RGB light strip, buzzer
+
+
+
 ## A plan:
 
 <img src="savelij.jpeg" width="300" alt="savelij">
