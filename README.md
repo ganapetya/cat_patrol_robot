@@ -1,9 +1,10 @@
-# Cat patrol robot
+# Cat patrol robot Savelij
 
 ## Periodically walking, recognizing cats, barking on them
 
 ## A plan:
 
+![Savelij](savelij.jpeg)
 
 Phase 0 — Foundation check (~1 week). Before SLAM, your TF tree and odometry must be sane. Write/verify a URDF for the X3 (Yahboom provides one — adapt it), 
 confirm odom → base_link is published, and do the classic test: teleop the robot in a 2m square and back; 
