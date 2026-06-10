@@ -30,6 +30,7 @@
 // ===========================================================================
 #include <algorithm>   // std::clamp, std::min, std::max
 #include <atomic>      // std::atomic — thread-safe variables for sensor callbacks
+#include <thread>      // std::thread — background Bluetooth connect on startup
 #include <cmath>       // M_PI, std::abs, std::hypot, atan2, etc.
 #include <memory>      // std::unique_ptr, std::shared_ptr — smart pointers
 #include <string>      // std::string
@@ -173,6 +174,10 @@ private:
   bool save_current_image();              // Convert ROS Image → JPEG on disk
   void send_mail_request();               // Publish JSON mail request to mail_node
   void set_buzzer(bool on);               // Turn onboard buzzer on or off
+  void play_completion_sound();           // Spawn audio player in background (no-op if path empty)
+  void start_bluetooth_connect_async();   // Background: pair RX-V485, route PulseAudio, play bark
+  bool connect_bluetooth_speaker();       // Blocking connect; returns true if bluez sink ready
+  std::string resolve_bt_connect_script() const;
   std::string escape_json(const std::string & s) const;  // Escape " and \ for JSON
   void reset_idle_loop();                 // Turn off buzzer when going idle
 
@@ -220,6 +225,14 @@ private:
   double drive_back_timeout_sec_{60.0};    // Max time to drive backward (s)
   double pattern_log_buffer_period_sec_{60.0};  // In-memory log window before flush
   std::string pattern_log_file_path_{"/tmp/cat_patrol_pattern.log"};  // Pattern log file
+  std::string completion_sound_path_;                  // Optional .wav played when patrol cycle completes (empty = disabled)
+  std::string completion_sound_player_{"paplay"};     // Player when BT ready (paplay routes to default sink)
+  bool bt_connect_on_start_{true};                     // Pair/connect BT speaker at node startup
+  std::string bt_speaker_mac_{"0C:8E:29:3B:F2:5F"};    // RX-V485 3BF25C
+  std::string bt_speaker_name_{"RX-V485"};             // Fallback name filter during scan
+  int bt_scan_seconds_{40};                              // How long to scan before giving up
+  std::string bt_connect_script_;                      // Optional override path to connect_bt_speaker.sh
+  std::atomic_bool bt_audio_ready_{false};             // True after BT sink is default
   double linear_speed_{0.2};               // Forward/backward speed (m/s)
   double angular_speed_{0.6};              // Turning speed (rad/s)
   double patrol_drive_sec_{10.0};          // Duration per leg (classic pattern)

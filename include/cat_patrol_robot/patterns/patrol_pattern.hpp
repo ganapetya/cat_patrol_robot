@@ -147,6 +147,11 @@ struct PatrolContext
   // Turn the onboard buzzer on (true) or off (false)
   std::function<void(bool)> set_buzzer;
 
+  // Play the "patrol completed" sound (e.g. bark.wav).  Non-blocking:
+  // the node spawns the player in a detached thread, so the pattern's
+  // tick loop is not stalled.  If no sound is configured, this is a no-op.
+  std::function<void()> play_completion_sound;
+
   // Get the current ROS time.  rclcpp::Time is a high-resolution timestamp
   // (nanosecond precision).  Subtraction gives rclcpp::Duration.
   //   auto dt = ctx.now() - some_earlier_time;

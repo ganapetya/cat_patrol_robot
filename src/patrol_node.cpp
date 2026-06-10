@@ -46,6 +46,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <cmath>
 #include <filesystem>
 #include <sstream>
@@ -180,6 +182,26 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   pattern_log_buffer_period_sec_ = declare_parameter<double>("pattern_log_buffer_period_sec", 60.0);
   pattern_log_file_path_ = declare_parameter<std::string>(
     "pattern_log_file_path", "/tmp/cat_patrol_pattern.log");
+  // Optional .wav file played when the patrol cycle finishes the 180° turn.
+  // Empty string disables playback.  The path may use ~ which is expanded
+  // below using $HOME.
+  completion_sound_path_ = declare_parameter<std::string>(
+    "completion_sound_path", "");
+  completion_sound_player_ = declare_parameter<std::string>(
+    "completion_sound_player", "paplay");
+  bt_connect_on_start_ = declare_parameter<bool>("bt_connect_on_start", true);
+  bt_speaker_mac_ = declare_parameter<std::string>(
+    "bt_speaker_mac", "0C:8E:29:3B:F2:5F");
+  bt_speaker_name_ = declare_parameter<std::string>("bt_speaker_name", "RX-V485");
+  bt_scan_seconds_ = declare_parameter<int>("bt_scan_seconds", 40);
+  bt_connect_script_ = declare_parameter<std::string>("bt_connect_script", "");
+  // Expand a leading ~/ using $HOME (declare_parameter doesn't do this).
+  if (!completion_sound_path_.empty() && completion_sound_path_[0] == '~') {
+    const char * home = std::getenv("HOME");
+    if (home) {
+      completion_sound_path_ = std::string(home) + completion_sound_path_.substr(1);
+    }
+  }
 
   // Forward/backward driving speed during patrol (meters per second).
   linear_speed_ = declare_parameter<double>("linear_speed", 0.2);
@@ -465,6 +487,10 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   } else {
     transition_to(PatrolState::Idle);
   }
+
+  if (bt_connect_on_start_ && !completion_sound_path_.empty()) {
+    start_bluetooth_connect_async();
+  }
 }
 
 // ===========================================================================
@@ -641,6 +667,128 @@ void PatrolNode::set_buzzer(bool on)
   std_msgs::msg::Bool b;
   b.data = on;
   buzzer_pub_->publish(b);
+}
+
+// ===========================================================================
+// play_completion_sound — spawn the audio player in the background
+// ===========================================================================
+// WHAT:  If completion_sound_path_ is non-empty, fire-and-forget a shell
+//        command like:   aplay -q /home/jetson/bark.wav
+//        The shell's trailing "&" detaches the player so the patrol's
+//        20 Hz tick loop is not blocked.
+//
+// WHY system() AND NOT A ROS TOPIC:
+//        The Yahboom Jetson has no buzzer-style ROS audio service; the
+//        onboard buzzer is already used for the per-frame beeps.  ALSA's
+//        aplay is the simplest reliable way to play a .wav file on this
+//        hardware, and `command &` is non-blocking once the child detaches.
+//
+// SAFETY:
+//        We only invoke system() if the path looks safe (no shell meta-
+//        characters).  This avoids accidental command injection from a
+//        misconfigured YAML.
+// ===========================================================================
+std::string PatrolNode::resolve_bt_connect_script() const
+{
+  if (!bt_connect_script_.empty() && std::filesystem::exists(bt_connect_script_)) {
+    return bt_connect_script_;
+  }
+  const std::filesystem::path installed{
+    "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/install/cat_patrol_robot/lib/"
+    "cat_patrol_robot/connect_bt_speaker.sh"};
+  if (std::filesystem::exists(installed)) {
+    return installed.string();
+  }
+  return {};
+}
+
+bool PatrolNode::connect_bluetooth_speaker()
+{
+  const std::string script = resolve_bt_connect_script();
+  if (script.empty()) {
+    RCLCPP_WARN(get_logger(),
+      "connect_bt_speaker.sh not found — set bt_connect_script or rebuild package");
+    return false;
+  }
+
+  static const std::string forbidden = "`$();|&<>\n\r\"\\'";
+  auto safe = [&](const std::string & s) {
+    return s.find_first_of(forbidden) == std::string::npos;
+  };
+  if (!safe(script) || !safe(bt_speaker_mac_) || !safe(bt_speaker_name_)) {
+    RCLCPP_WARN(get_logger(), "BT connect: unsafe characters in path/MAC/name");
+    return false;
+  }
+
+  const std::string cmd = "bash \"" + script + "\" \"" + bt_speaker_mac_ + "\" \"" +
+    bt_speaker_name_ + "\" " + std::to_string(bt_scan_seconds_);
+
+  RCLCPP_INFO(get_logger(), "Connecting BT speaker: %s (%s)", bt_speaker_name_.c_str(),
+    bt_speaker_mac_.c_str());
+  const int rc = std::system(cmd.c_str());
+  if (rc != 0) {
+    int code = rc;
+    if (WIFEXITED(rc)) {
+      code = WEXITSTATUS(rc);
+    }
+    RCLCPP_WARN(get_logger(),
+      "BT speaker connect failed (exit %d) — power ON RX-V485, disconnect it from phone, "
+      "keep within ~5 m; test: bash %s",
+      code, script.c_str());
+    return false;
+  }
+  bt_audio_ready_.store(true);
+  RCLCPP_INFO(get_logger(), "BT speaker ready (PulseAudio default sink is bluez)");
+  return true;
+}
+
+void PatrolNode::start_bluetooth_connect_async()
+{
+  std::thread([this]() {
+    if (connect_bluetooth_speaker()) {
+      play_completion_sound();
+    }
+  }).detach();
+}
+
+void PatrolNode::play_completion_sound()
+{
+  if (completion_sound_path_.empty()) {
+    return;  // playback disabled
+  }
+
+  if (bt_connect_on_start_ && !bt_audio_ready_.load()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+      "Skipping bark — BT speaker not connected yet");
+    return;
+  }
+
+  // Reject anything that looks like a shell injection attempt.  These chars
+  // have no business in a file path on Linux.
+  static const std::string forbidden = "`$();|&<>\n\r\"\\'";
+  if (completion_sound_path_.find_first_of(forbidden) != std::string::npos) {
+    RCLCPP_WARN(get_logger(),
+      "completion_sound_path contains shell metacharacters — refusing to play: %s",
+      completion_sound_path_.c_str());
+    return;
+  }
+
+  // paplay needs the user PulseAudio socket (XDG_RUNTIME_DIR), especially when
+  // patrol_node is started from systemd/launch without a full desktop session.
+  const char * runtime = std::getenv("XDG_RUNTIME_DIR");
+  const std::string runtime_dir = (runtime && runtime[0] != '\0') ?
+    std::string(runtime) : ("/run/user/" + std::to_string(getuid()));
+  const std::string player = bt_audio_ready_.load() ? "paplay" : completion_sound_player_;
+  const std::string cmd = "XDG_RUNTIME_DIR=" + runtime_dir + " " + player + " \"" +
+    completion_sound_path_ + "\" >/dev/null 2>&1 &";
+
+  RCLCPP_INFO(get_logger(), "Playing completion sound: %s", cmd.c_str());
+  const int rc = std::system(cmd.c_str());
+  if (rc != 0) {
+    RCLCPP_WARN(get_logger(),
+      "completion sound playback returned non-zero (%d) — check BT connection and paplay",
+      rc);
+  }
 }
 
 // ===========================================================================
@@ -895,6 +1043,7 @@ PatrolContext PatrolNode::build_patrol_context()
   ctx.save_current_image = [this]() { return save_current_image(); };
   ctx.send_mail_request = [this]() { send_mail_request(); };
   ctx.set_buzzer = [this](bool on) { set_buzzer(on); };
+  ctx.play_completion_sound = [this]() { play_completion_sound(); };
   ctx.now = [this]() { return now(); };
   ctx.get_logger = [this]() { return get_logger(); };
   ctx.clock = get_clock();

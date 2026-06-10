@@ -780,6 +780,13 @@ PatrolSignal TillObstacleBackPattern::tick_turn_around(PatrolContext & ctx)
         RCLCPP_INFO(ctx.get_logger(),
           "[till_obstacle_back] Turn complete — %d steps done, pattern done",
           turn_steps_done_);
+        // Fire the "patrol finished" sound (e.g. bark.wav) once the final
+        // 180° turn is finished.  Non-blocking — see PatrolNode::
+        // play_completion_sound().  Safe to call even if the callback was
+        // not provided (treat as no-op).
+        if (ctx.play_completion_sound) {
+          ctx.play_completion_sound();
+        }
         enter_phase(Phase::Done, ctx);
         append_buffered_log(ctx, "Turn-around complete");
         maybe_flush_buffered_logs(ctx, true);

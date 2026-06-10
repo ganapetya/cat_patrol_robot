@@ -37,6 +37,8 @@ install(DIRECTORY config launch systemd DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/run_cat_patrol.sh
   scripts/play_bark.sh
+  scripts/connect_bt_speaker.sh
+  scripts/enable_bt_a2dp.sh
   scripts/mail_node
   scripts/check_active_config.sh
   DESTINATION lib/${PROJECT_NAME})

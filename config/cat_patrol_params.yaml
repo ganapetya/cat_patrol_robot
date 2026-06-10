@@ -294,6 +294,27 @@
     use_joy_override: false
 
     # =========================================================================
+    # COMPLETION SOUND + BLUETOOTH SPEAKER (RX-V485 3BF25C)
+    # =========================================================================
+    # On patrol_node startup: scan, pair, and connect the BT speaker, route
+    # PulseAudio to it, then play bark.wav once ("robot ready").
+    # After each patrol cycle (180° turn done): play bark.wav again.
+    #
+    # Speaker seen in scan: "RX-V485 3BF25C Bluetooth" MAC 0C:8E:29:3B:F2:5F
+    # Power the speaker on and put it in pairing mode before starting the robot.
+    #
+    # ONE-TIME SETUP (Yahboom Jetson): NVIDIA disables BT audio by default.
+    # If connect fails with "No bluez PulseAudio sink", run:
+    #   sudo bash install/cat_patrol_robot/lib/cat_patrol_robot/enable_bt_a2dp.sh
+    completion_sound_path: "/home/jetson/bark.wav"
+    completion_sound_player: "paplay"    # used only if BT connect is disabled
+    bt_connect_on_start: true
+    bt_speaker_mac: "0C:8E:29:3B:F2:5F"
+    bt_speaker_name: "RX-V485"           # fallback if MAC not in device list yet
+    bt_scan_seconds: 40
+    bt_connect_script: ""              # empty = auto: install/.../connect_bt_speaker.sh
+
+    # =========================================================================
     # EMAIL SETTINGS
     # =========================================================================
     # The patrol_node publishes a JSON string on this topic.  The mail_node
