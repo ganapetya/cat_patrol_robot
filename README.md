@@ -28,7 +28,7 @@ OLED status display, RGB light strip, buzzer
 
 
 
-## A plan:
+## Execution plan:
 
 <img src="savelij.jpeg" width="300" alt="savelij">
 
