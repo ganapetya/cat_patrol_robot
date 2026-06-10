@@ -4,7 +4,8 @@
 
 ## A plan:
 
-![Savelij](savelij.jpeg)
+<img src="savelij.jpeg" width="300" alt="savelij">
+
 
 Phase 0 — Foundation check (~1 week). Before SLAM, your TF tree and odometry must be sane. Write/verify a URDF for the X3 (Yahboom provides one — adapt it), 
 confirm odom → base_link is published, and do the classic test: teleop the robot in a 2m square and back; 
