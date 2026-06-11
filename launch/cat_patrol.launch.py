@@ -202,8 +202,12 @@ def generate_launch_description():
     )
     lidar_frame_id_arg = DeclareLaunchArgument(
         'lidar_frame_id',
-        default_value='laser',
-        description='TF frame_id published by the LiDAR driver.',
+        default_value='laser_link',
+        description='TF frame_id published by the LiDAR driver. Must match the URDF '
+                    'static TF chain (yahboomcar_X3.urdf defines base_link -> laser_link). '
+                    'If this is set to a frame that does not exist in /tf_static '
+                    '(e.g. plain "laser"), then SLAM/AMCL/Nav2 will silently fail to '
+                    'project /scan into base_link and produce empty maps.',
     )
 
     # -----------------------------------------------------------------------
@@ -261,8 +265,19 @@ def generate_launch_description():
             ))
 
         # --- Chassis driver (conditional on robot type) ---
-        # The bringup launch files start the motor driver, publish /cmd_vel
-        # listener, and broadcast TF transforms (odom → base_footprint).
+        # The bringup launch file starts a small stack:
+        #   - Mcnamu_driver_X3      (Python)  Reads MCU -> /vel_raw, /imu/data_raw,
+        #                                     /joint_states, /voltage. Listens on
+        #                                     /cmd_vel. Does NOT publish /odom or TF.
+        #   - base_node_X3          (C++)     Integrates wheel velocity into /odom_raw.
+        #                                     Does NOT publish odom->base_footprint TF
+        #                                     (pub_odom_tf=false), because…
+        #   - imu_filter_madgwick   (C++)     /imu/data_raw -> /imu/data (filtered).
+        #   - robot_localization EKF (C++)    Fuses /odom_raw + /imu/data ->
+        #                                     /odom (filtered) AND publishes the
+        #                                     odom -> base_footprint TF.
+        # If you ever see Nav2 "stuck" because the TF chain is broken, the EKF
+        # is the most likely culprit -- not the chassis driver itself.
         if robot == 'x3':
             entities.append(
                 IncludeLaunchDescription(

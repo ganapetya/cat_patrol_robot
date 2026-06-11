@@ -71,6 +71,21 @@ during a 5-minute teleop session.
 > fast on carpet. If the square test is way off, that's a *real* finding —
 > note it now, because it'll explain weirdness later in Phase 2.
 
+### Phase 0 findings on this robot (2026-06-11)
+
+- TF tree clean: `odom → base_footprint → base_link → {wheels, imu_link, camera_link, laser_link}`. The EKF (`robot_localization`) is what publishes `odom → base_footprint`, **not** the chassis driver — `Mcnamu_driver_X3.py` only publishes raw IMU/`vel_raw`/joint_states, and `base_node_X3` integrates `vel_raw` into `/odom_raw` without broadcasting TF.
+- LiDAR `frame_id` mismatch fixed in `cat_patrol.launch.py`: was `'laser'`, now `'laser_link'` to match the URDF static TF chain.
+- **Mechanical bias.** Commanded `linear.x=0.15 m/s` straight forward, `angular.z=0`, the X3 physically curves to the right (initial measurement: ≈51 cm over 3.13 m). The EKF (gyro-fused IMU) sees this curve correctly: `/odom` reports the same ~51 cm Δy, ~−4.8° Δyaw. So odom is honest about the drift; the robot itself just doesn't drive straight on command. AMCL/SLAM should be unaffected since they don't rely on the robot driving straight, only on `/odom` reflecting reality.
+- **Per-wheel encoder asymmetry (`scripts/wheel_balance_diagnostic.py`).** With `set_car_motion(0.15, 0, 0)`:
+  - On blocks: m1=FL +1.6%, m2=BL −2.5%, m3=FR −2.2%, m4=BR +3.2% from the 4-wheel mean (~5% diagonal {FL,BR} > {BL,FR} pattern).
+  - On floor (under load): same diagonal pattern shrinks slightly but a *new* left-vs-right asymmetry appears (left side ~3.8% faster), most likely from lateral CG offset + load-dependent motor saturation. FR is consistently the slowest wheel; FL the fastest, on both surfaces. This is below the ~2% "all balanced" threshold for both pure motor and pure mechanical fixes, so the cause is partly motor balance and partly wheel/floor coupling.
+- **Software trim in `Mcnamu_driver_X3.py`.** Two new chassis-level parameters added (`trim_vy_per_vx`, `trim_w_per_vx`, both default 0.0). They inject a small leftward strafe / yaw correction proportional to commanded forward velocity, before calling `set_car_motion`. The firmware's per-wheel PID then implements the corrected command. Calibrated empirically on this unit:
+  - **`trim_vy_per_vx = 0.012`** at cruise speed ~0.15 m/s.
+  - `trim_w_per_vx = 0.0` (yaw bias was small enough not to need correction).
+  - Naive trim from the raw single-drive ratio (Δy/Δx ≈ −0.163) is **14× too large** because the cumulative drift includes a lot of transient noise. The right calibration is bisection by repeated trial, not extrapolation from one drive.
+  - The trim is speed-dependent. Calibrated at 0.15 m/s; expect somewhat worse straight-line behavior at very different speeds. Nav2's controller (Phase 3) closes the loop on `/odom` and will compensate for any residual bias, so this trim is mainly for nicer teleop.
+- `tf_vs_topic` disagreement stays at 0.0000 m — `/odom` topic and `odom→base_footprint` TF are perfectly consistent (both come from the same EKF instance).
+
 ---
 
 ## Phase 1 — Map the room  (1–2 weeks)
