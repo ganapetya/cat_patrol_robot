@@ -85,6 +85,17 @@ during a 5-minute teleop session.
   - Naive trim from the raw single-drive ratio (Δy/Δx ≈ −0.163) is **14× too large** because the cumulative drift includes a lot of transient noise. The right calibration is bisection by repeated trial, not extrapolation from one drive.
   - The trim is speed-dependent. Calibrated at 0.15 m/s; expect somewhat worse straight-line behavior at very different speeds. Nav2's controller (Phase 3) closes the loop on `/odom` and will compensate for any residual bias, so this trim is mainly for nicer teleop.
 - `tf_vs_topic` disagreement stays at 0.0000 m — `/odom` topic and `odom→base_footprint` TF are perfectly consistent (both come from the same EKF instance).
+- **Closed-loop drift test (out-and-back, 4.69 m total path).** After the chassis trim was calibrated, drove forward 2.31 m at 0.15 m/s, stopped, drove backward to start. `/odom` resting pose:
+  - Position drift: **14.4 cm** (5.6 cm behind start + 13.2 cm to the left). Within plan's "10–20 cm healthy" band.
+  - Yaw drift: **−4.7°**. Within plan's "5–10° healthy" band.
+  - The forward leg was clean (≈2 mm lateral over 2.31 m). Most of the drift accumulated during backward motion (the trim is calibrated only for forward; backward direction would need a separate `trim_vy_per_vx_reverse`). The yaw drift accumulated steadily across the whole drive.
+  - **Phase 0 acceptance criteria met. `/odom` is trustworthy enough for Phases 1–3.**
+- **Mecanum on mixed floor surfaces — surface-dependence of in-place rotation.** This robot operates in an environment with **carpet in one area and smooth flooring (laminate / tile) in the rest**. The two surfaces produce dramatically different behaviour for in-place rotation commands (`angular.z != 0`, `linear.x = 0`), tested with a 12-second `j` press at 1.0 rad/s commanded:
+  - **On carpet**: physical motion was ~360° in place with ~5 cm of unwanted translation. `/odom` agreed (yaw integrated ~372°, position drifted ~4.3 cm). Mecanum rollers grip carpet pile, lateral pivot forces are real, kinematics work as designed.
+  - **On smooth floor**: physical motion was ~190 cm of arc-shaped translation (165 cm back + 95 cm left) with only ~90° of physical rotation. `/odom` reported ~3 cm of translation and ~113° of yaw — the IMU caught the rotation roughly correctly, but the wheel-derived chassis Twist saw none of the lateral sliding. Mecanum rollers slip on smooth floors; lateral force becomes friction-limited; the chassis drifts in an arc rather than pivoting.
+  - **Implication**: position estimates from `/odom` alone are **not reliable on the smooth-floor area during rotation**. The IMU yaw is reliable on both surfaces. Phases 1–2 (SLAM and AMCL) will partly compensate via lidar-based localization (`map → odom` correction); Phase 3 (Nav2 controller) will compensate fully via closed-loop control over scan-matched pose. Until then, prefer **arcing turns** (`forward + small angular.z`) over in-place rotation on smooth floors — the wheels stay rolling forward, where mecanum is honest.
+  - **Behavioural takeaway for the patrol manager (Phase 4 onward)**: design waypoint paths so that in-place rotations happen on carpet whenever possible, and arcing turns are used on the smooth-floor area. The patrol manager's strategy can choose, given a map of which floor type is where.
+  - **No simple software trim fixes this.** Roller slip is highly non-linear in velocity and surface. The fix path is the lidar-feedback loop in Phases 2–3, not a constant coefficient.
 
 ---
 

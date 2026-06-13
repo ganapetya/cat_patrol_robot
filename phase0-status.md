@@ -1,5 +1,7 @@
 # Phase 0 — Status & Reference
 
+[Google Doc of learning material for the phase 0](https://docs.google.com/document/d/1MdjIR7VsIDVTOT6noHQWUqswjvca93G5HCrSGA-LRaQ/edit?usp=sharing)
+
 Companion to `plan.md`. This is the practical, "what did we actually do
 today" document — file inventory, command cheat-sheet, observed topics, and
 lessons learned. Read alongside `plan.md` (which has the project arc) and
@@ -295,12 +297,17 @@ In rough order of "I wish I'd known this before".
 16. **Calibration is empirical and should always be bisected, never extrapolated from a single measurement.** Single drives include noise that swamps the steady-state bias.
 17. **`linear_velocity_x = vx * linear_scale_x_` in `base_node_X3.cpp` affects how `/odom_raw` is INTEGRATED, not how the wheels actually move.** If you want to change the actual chassis behaviour, you have to act on the cmd_vel side (before `set_car_motion`), not on the odom side.
 18. **`/odom` is observation-only at this stage of the project.** Nothing reads `/odom` and writes back to `/cmd_vel`. The closed loop appears in Phase 3 with `nav2_controller`. Until then, "the robot doesn't drive straight" is purely a teleop annoyance, not a navigation blocker.
+19. **Mecanum behaviour is heavily floor-dependent.** Tested with a 12-second `j` (rotate left) command at 1.0 rad/s commanded:
+    - **On carpet**: ~360° in-place rotation, ~5 cm unwanted translation. /odom matches reality. The mecanum rollers grip carpet pile, the kinematics work as designed.
+    - **On smooth floor (laminate / tile)**: ~190 cm of arcing translation (165 cm back + 95 cm left) with only ~90° of physical rotation. /odom only sees ~3 cm of translation — the wheel-derived chassis Twist is blind to lateral roller-slip. The IMU-derived yaw is roughly correct (~113° in /odom).
+    - **Practical implication**: position estimates from /odom are unreliable on smooth floors during rotation. Yaw is reliable on both surfaces. Phases 1–2 (SLAM, AMCL) compensate via lidar; until then, prefer arcing turns (forward + small angular.z) on smooth floors.
+20. **The robot's actual environment has BOTH surfaces** — carpet in one area, smooth flooring in the rest. The patrol manager (Phase 4 onward) should be aware of which area is which, and prefer to schedule in-place rotations on the carpet area when possible. The map built in Phase 1 won't directly know about floor type, so this is information you'd add manually (or via a future "floor segmentation" extension).
 
 ---
 
 ## 5. Calibration record (this specific X3 unit)
 
-| Parameter | Value | Notes |
+| Parameter / metric | Value | Notes |
 |-----------|-------|-------|
 | `trim_vy_per_vx` | **0.012** | Calibrated at vx ~0.15 m/s on hardwood floor. Empirical bisection from initial 0.04. |
 | `trim_w_per_vx` | 0.0 | Yaw bias at this speed was small enough to ignore. |
@@ -308,6 +315,9 @@ In rough order of "I wish I'd known this before".
 | Per-wheel encoder spread (on blocks) | ±3.2% from mean | FL fastest, BL slowest, FR slow, BR fastest. |
 | Per-wheel encoder spread (on floor) | ±4.5% from mean | FL gets faster under load; BL converges to mean. |
 | Approximate baseline path rate | 587 ticks/s on floor / 704 ticks/s on blocks @ 0.15 m/s commanded | The 17% drop on the floor is normal motor-load behaviour. |
+| Closed-loop drift (out-and-back, 4.69 m total path, with trim active) | **14.4 cm position, 4.7° yaw** | Phase 0 acceptance gate. Within plan's "10–20 cm position, 5–10° yaw" healthy band. Forward leg was ≈2 mm lateral over 2.31 m (clean); most drift came from the uncalibrated backward leg. |
+| In-place rotation on carpet (12 s `j`, 1.0 rad/s commanded) | ~360° physical, ~5 cm translation, +12.5° final yaw in /odom | Mecanum kinematics work as designed; /odom matches reality. |
+| In-place rotation on smooth floor (12 s `j`, 1.0 rad/s commanded) | ~90° physical rotation, ~190 cm translation; /odom shows ~3 cm translation, ~113° yaw | Mecanum rollers slip; chassis arcs instead of pivoting. /odom is blind to the lateral sliding (yaw is roughly right via IMU). |
 
 If you re-build the robot or service the wheels, **re-run
 `wheel_balance_diagnostic.py measure` and re-do the trim bisection**.
@@ -331,3 +341,18 @@ Not blocking; just noted for later.
 - The chassis trim only fixes forward motion. Strafe and rotation aren't
   compensated. They probably don't need to be (Nav2 will close the loop)
   but worth checking once we get there.
+- **Surface-aware patrol planning (Phase 4+).** The patrol manager could
+  benefit from knowing which areas of the map are carpet vs smooth floor,
+  and preferring to put in-place rotations on the carpet. Implementation
+  ideas, ordered cheap-to-expensive:
+  - **Manual annotation**: hand-paint a `floor_type.yaml` (or PNG) over the
+    SLAM map after Phase 1, encoding "carpet here, smooth there".
+  - **Slip detector**: at runtime, watch the disagreement between IMU yaw
+    rate and wheel-derived yaw rate. When the chassis is commanded to
+    rotate in place but the lidar/AMCL pose isn't actually rotating in
+    place (i.e., the chassis has slid), tag the current location as
+    "slippery" in a slip-cost map. Over many patrols the map fills in.
+  - **Behaviour selection**: when planning a patrol leg that requires a
+    heading change, the patrol manager picks the route that lets the
+    rotation happen on carpet, even if the carpet route is geometrically
+    longer.
