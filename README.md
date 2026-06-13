@@ -39,7 +39,7 @@ The robot is fully autonomous on-board — no off-board compute, no cloud
 inference. The Jetson does its own vision and navigation. Email is sent
 directly from the Jetson over Wi-Fi.
 
-## Plan and current status
+## Plan, status, hardware
 
 The full step-by-step execution plan, with C++/ROS 2 learning goals for
 each phase and "done-when…" criteria, lives in:
@@ -48,6 +48,9 @@ each phase and "done-when…" criteria, lives in:
 - **[phase0-status.md](phase0-status.md)** — what was actually done in Phase
   0: files created/modified, topics observed, commands used, lessons
   learned, calibration record
+- **[hardware.md](hardware.md)** — full hardware reference: power flow,
+  boards, sensors, port assignments, topic map, known limitations,
+  empirical calibration values for *this specific unit*
 
 ## Repo layout
 
