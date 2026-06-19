@@ -103,9 +103,9 @@ flowchart TB
     %% --- Mcnamu_driver outputs (10 Hz) ---
     MC -- "/vel_raw<br/>(Twist)" --> BASE
     MC -- "/imu/data_raw" --> MADG
-    MC -- "/imu/mag" -.-> MADG
+    MC -. "/imu/mag" .-> MADG
     MC -- "/joint_states" --> JSP
-    MC -- "/voltage" -.-> Future["(future)<br/>battery monitor<br/>Phase 7"]
+    MC -. "/voltage" .-> Future["(future)<br/>battery monitor<br/>Phase 7"]
 
     %% --- LiDAR ---
     LIDARHW -- "USB-serial<br/>(/dev/ttyUSB0)" --> SLLIDAR
