@@ -51,6 +51,10 @@ each phase and "done-when…" criteria, lives in:
 - **[hardware.md](hardware.md)** — full hardware reference: power flow,
   boards, sensors, port assignments, topic map, known limitations,
   empirical calibration values for *this specific unit*
+- **[architecture.md](architecture.md)** — system architecture diagram:
+  signal flow from hardware up through the EKF, TF tree, and into
+  Phase 1+ SLAM/Nav2; commands flowing back down through the trim layer
+  to the wheels
 
 ## Repo layout
 
