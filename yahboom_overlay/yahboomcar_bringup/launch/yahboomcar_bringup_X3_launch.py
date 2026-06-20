@@ -73,6 +73,19 @@ def generate_launch_description():
         description='w_correction = trim * vx (rad/s per m/s).',
     )
 
+    joy_xspeed_limit_arg = DeclareLaunchArgument(
+        'joy_xspeed_limit', default_value='0.15',
+        description='Max forward/back speed from joystick (m/s). Full stick = this value.',
+    )
+    joy_yspeed_limit_arg = DeclareLaunchArgument(
+        'joy_yspeed_limit', default_value='0.15',
+        description='Max strafe speed from joystick (m/s). Full stick = this value.',
+    )
+    joy_angular_speed_limit_arg = DeclareLaunchArgument(
+        'joy_angular_speed_limit', default_value='0.5',
+        description='Max turn rate from joystick (rad/s). Full stick = this value.',
+    )
+
     robot_description = ParameterValue(Command(['xacro ', LaunchConfiguration('model')]),
                                        value_type=str)
 
@@ -147,6 +160,11 @@ def generate_launch_description():
         package='yahboomcar_ctrl',
         executable='yahboom_joy_X3',
         condition=IfCondition(LaunchConfiguration('use_joystick')),
+        parameters=[{
+            'xspeed_limit': ParameterValue(LaunchConfiguration('joy_xspeed_limit'), value_type=float),
+            'yspeed_limit': ParameterValue(LaunchConfiguration('joy_yspeed_limit'), value_type=float),
+            'angular_speed_limit': ParameterValue(LaunchConfiguration('joy_angular_speed_limit'), value_type=float),
+        }],
     )
     joy_node = Node(
         package='joy',
@@ -164,6 +182,9 @@ def generate_launch_description():
         use_joystick_arg,
         trim_vy_per_vx_arg,
         trim_w_per_vx_arg,
+        joy_xspeed_limit_arg,
+        joy_yspeed_limit_arg,
+        joy_angular_speed_limit_arg,
         joint_state_publisher_node,
         joint_state_publisher_gui_node,
         robot_state_publisher_node,
