@@ -5,6 +5,11 @@ Companion to [`plan.md`](plan.md), [`hardware.md`](hardware.md),
 This is the practical "what we plan to do for Phase 1, what we actually
 did, and what we learned" document.
 
+**Mapping does not run `cat_patrol_robot`.** That package is the patrol app
+(Phase 4+). Phase 1 uses only `yahboomcar_bringup`, `sllidar_ros2`, and
+`slam_toolbox`. Saved maps go under `cat_patrol_robot/maps/` as project
+artifacts.
+
 Phase 1 = build a 2D map of one room with `slam_toolbox`, save it to
 disk, and write a single-command launch file that reproduces the SLAM
 session. **Scope deliberately small** — one room only. Multi-room
@@ -100,15 +105,15 @@ every mapping session.
   session start. This makes "did I return home?" answerable.
 - Create the maps directory:
       `mkdir -p ~/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/maps`
-- Build `cat_patrol_robot` once (installs `scan_front_filter`):
-      `cd ~/yahboomcar_ros2_ws/yahboomcar_ws && colcon build --packages-select cat_patrol_robot --symlink-install`
+- Build `yahboomcar_bringup` after pulling mapping updates:
+      `cd ~/yahboomcar_ros2_ws/yahboomcar_ws && colcon build --packages-select yahboomcar_bringup --symlink-install`
 - **RViz runs on the host PC (Noble + ROS Jazzy)**, not on the Jetson.
   Install `ros-jazzy-rviz2` on the host. Save your working RViz layout
   there (Displays: Map `/map` with **Transient Local** durability,
   LaserScan `/scan_filtered`, Fixed Frame `map`, Views Target Frame
   `base_footprint`).
 - SLAM params for this robot live at
-  [`config/mapper_params_online_async.yaml`](config/mapper_params_online_async.yaml)
+  [`yahboomcar_bringup/param/mapper_params_online_async.yaml`](../yahboomcar_bringup/param/mapper_params_online_async.yaml)
   (lighter than upstream defaults — required on 8 GB Jetson).
 
 ### 3b. Every-session checklist
@@ -134,9 +139,166 @@ every mapping session.
 
 ## 4. Mapping session procedure (step-by-step recipe)
 
-A SLAM session uses **six Jetson terminals** plus **RViz on the host**.
-Each Jetson stack on its own terminal so any one can be killed without
-taking down the others.
+### Tomorrow — start here (exact order)
+
+**Packages used:** `yahboomcar_bringup` + `sllidar_ros2` + `slam_toolbox` only.
+**Not used:** `cat_patrol_robot` (patrol app — only the `maps/` folder for saving).
+
+#### A. Before any terminals (5 min)
+
+On **Jetson**:
+
+```bash
+# 1) Clean memory floor — reboot if swap was used in a prior OOM crash
+free -h
+# If "Swap" used > 512 MiB → reboot the Jetson first
+
+# 2) Optional but recommended — frees ~100+ MB
+sudo systemctl stop ollama
+
+# 3) Find chassis USB port (CH340 7523 — NOT the LiDAR port)
+for d in /dev/ttyUSB*; do
+  pid=$(udevadm info -q property -n "$d" 2>/dev/null | grep '^ID_MODEL_ID=' | cut -d= -f2)
+  [ "$pid" = "7523" ] && echo "CHASSIS=$d"
+done
+# Example output: CHASSIS=/dev/ttyUSB0  ← use this in T1 below
+
+# 4) Confirm LiDAR by-id symlink (should NOT be the same as CHASSIS)
+readlink -f /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+# Example: /dev/ttyUSB1
+```
+
+On **host** (peter-pen): no need to start anything yet.
+
+#### B. Jetson — four terminals, in order
+
+**Every Jetson terminal — paste first:**
+
+```bash
+export ROS_DOMAIN_ID=28
+source /opt/ros/humble/setup.bash
+source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
+```
+
+**T1 — bringup** (replace `/dev/ttyUSB0` if step A found a different `CHASSIS=`):
+
+```bash
+ros2 launch yahboomcar_bringup yahboomcar_bringup_X3_launch.py \
+    chassis_serial_port:=/dev/ttyUSB0 \
+    use_joystick:=true \
+    trim_vy_per_vx:=0.012
+```
+
+Wait for: `cmd_vel trim: trim_vy_per_vx=0.0120`
+
+Quick check (same or new Jetson terminal, sourced):
+
+```bash
+ros2 node list | grep driver_node
+ros2 topic echo /voltage --once
+```
+
+**T2 — LiDAR** (only after T1 is healthy):
+
+```bash
+ros2 launch sllidar_ros2 sllidar_launch.py \
+    serial_port:=/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0 \
+    serial_baudrate:=115200 \
+    frame_id:=laser_link
+```
+
+Wait for: `SLLidar health status : OK`
+
+If you see `cannot retrieve SLLidar health code: 80008002` → wrong port conflict.
+Ctrl+C T1 and T2; re-run step A; chassis and lidar must be **different** `/dev/ttyUSB*`.
+
+**T2b — scan filter** (wait ~5 s after T2 OK):
+
+```bash
+ros2 run yahboomcar_bringup scan_front_filter
+```
+
+Wait for: `Keeping scan angles [-90, 90] deg -> /scan_filtered`
+
+**T3 — SLAM** (wait ~5 s after T2b):
+
+```bash
+ros2 launch slam_toolbox online_async_launch.py \
+    use_sim_time:=false \
+    slam_params_file:=/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_bringup/param/mapper_params_online_async.yaml
+```
+
+Wait **30 seconds**. Ignore early `Message Filter dropping message` lines.
+Success: `Registering sensor: [Custom Described Lidar]` and **no** `exit code -9`.
+
+Before RViz, on Jetson:
+
+```bash
+free -h
+# need ≥ 2 GiB in "available" column
+```
+
+#### C. Host — RViz last (terminal 4)
+
+**Only after T3 has run 30 s and `free -h` looks OK.**
+
+```bash
+export ROS_DOMAIN_ID=28
+export ROS_LOCALHOST_ONLY=0
+source /opt/ros/jazzy/setup.bash
+ros2 run rviz2 rviz2 -d /home/bots/all/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_rviz/rviz/mapping.rviz
+```
+
+Use **your saved host config** if you exported one instead of `mapping.rviz`.
+
+**RViz displays (minimum — saves Jetson RAM):**
+
+| Display | Setting |
+|---|---|
+| Fixed Frame | `map` |
+| Views → Target Frame | `base_footprint` |
+| Map | topic `/map`, Durability **Transient Local** |
+| LaserScan | topic `/scan_filtered` |
+| TF | **disable** (reduces OOM risk over WiFi) |
+
+#### D. Drive and save
+
+- Joystick on **Jetson** USB; Start = buzzer only; sticks drive at ~0.15 m/s max.
+- Drive slowly along walls; arcing turns on smooth floor (no spin-in-place).
+- When map looks good:
+
+```bash
+cd ~/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/maps
+ros2 run nav2_map_server map_saver_cli -f my_room
+```
+
+#### E. If anything dies with `exit -9` or `Bad alloc`
+
+1. Ctrl+C **all** Jetson terminals + close host RViz.
+2. Wait 10 s (or reboot if swap is high).
+3. Start again from **A**.
+
+#### F. Optional — one Jetson terminal instead of T1–T3
+
+```bash
+export ROS_DOMAIN_ID=28
+source /opt/ros/humble/setup.bash
+source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
+sudo systemctl stop ollama   # optional
+ros2 launch yahboomcar_bringup slam_mapping_X3_launch.py \
+    chassis_serial_port:=/dev/ttyUSB0 \
+    trim_vy_per_vx:=0.012
+```
+
+Then wait 30 s → `free -h` → host RViz (step C). EKF + IMU stay enabled.
+
+---
+
+### Reference detail (same session, more explanation)
+
+A SLAM session uses **four Jetson terminals** (or optional single launch above)
+plus **RViz on the host**. Each Jetson stack on its own terminal so any one
+can be killed without taking down the others.
 
 **Topic chain (do not mix these up):**
 
@@ -147,15 +309,28 @@ taking down the others.
 | `/map` | `slam_toolbox` | RViz Map (QoS: **Transient Local**) |
 
 **Startup order:** T1 bringup → wait for `/driver_node` → T2 lidar →
-T2b scan filter → wait ~5 s → T3 SLAM → wait ~20 s → host RViz.
+T2b scan filter → wait ~5 s → T3 SLAM → wait **~30 s** → check memory →
+host RViz **last**.
+
+Before opening RViz on the host, on the Jetson run:
+
+```bash
+free -h
+```
+
+You want **≥ 2 GiB** in the `available` column. If lower, wait 10 s and
+retry; do not open RViz yet. Host RViz joining the DDS network adds
+load on the Jetson — starting it too early (or with SLAM still settling)
+can trigger OOM kills (`exit code -9`, `Bad alloc` in bringup).
 
 ### Terminal 1 — bringup (chassis + EKF + IMU + joystick)
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch yahboomcar_bringup yahboomcar_bringup_X3_launch.py \
-    chassis_serial_port:=/dev/ttyUSB1 \
+    chassis_serial_port:=/dev/ttyUSB0 \
     use_joystick:=true \
     trim_vy_per_vx:=0.012
 ```
@@ -180,6 +355,7 @@ below.
 ### Terminal 2 — LiDAR
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch sllidar_ros2 sllidar_launch.py \
@@ -195,9 +371,10 @@ Those hits look like phantom walls and ruin SLAM. This node keeps only the
 forward ±90° arc and publishes `/scan_filtered`.
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
-ros2 run cat_patrol_robot scan_front_filter
+ros2 run yahboomcar_bringup scan_front_filter
 ```
 
 In RViz set **LaserScan → Topic** to `/scan_filtered` (not `/scan`).
@@ -205,7 +382,7 @@ In RViz set **LaserScan → Topic** to `/scan_filtered` (not `/scan`).
 If front/rear look swapped, tune angles (degrees behind the robot kept out):
 
 ```bash
-ros2 run cat_patrol_robot scan_front_filter --ros-args \
+ros2 run yahboomcar_bringup scan_front_filter --ros-args \
     -p trusted_angle_min:=1.5708 -p trusted_angle_max:=-1.5708
 ```
 
@@ -216,21 +393,24 @@ points SLAM at `/scan_filtered`, caps memory use on the 8 GB Jetson, and
 sets `do_loop_closing: false`.
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch slam_toolbox online_async_launch.py \
     use_sim_time:=false \
-    slam_params_file:=/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/config/mapper_params_online_async.yaml
+    slam_params_file:=/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_bringup/param/mapper_params_online_async.yaml
 ```
 
-Wait **20 seconds** after start. You will see many `Message Filter
+Wait **30 seconds** after start. You will see many `Message Filter
 dropping message` lines — **normal at startup**. Success signs:
 
 - `Registering sensor: [Custom Described Lidar]`
-- Drop messages **stop** after ~20 s
-- **No** `process has died … exit code -9` (OOM — close host RViz and retry)
+- Drop messages **stop** after ~20–30 s
+- **No** `process has died … exit code -9` (OOM — see section 7 recovery)
+- **No** `ekf_node Failed to meet update rate` spam (symptom of CPU/RAM pressure)
 
-Do **not** Ctrl+C during the first 20 s thinking it failed.
+Do **not** Ctrl+C during the first 30 s thinking it failed. Do **not**
+open host RViz until SLAM has been stable for 30 s.
 
 ### Terminal 4 — RViz on **host PC** (not Jetson)
 
@@ -253,7 +433,7 @@ Or your saved config from the host if you exported one.
 | **Views → Target Frame** | `base_footprint` | camera follows robot |
 | **Map** | `/map` | **Durability: Transient Local** |
 | **LaserScan** | `/scan_filtered` | half-circle forward arc |
-| **TF** | (default) | RobotModel often errors on host (no mesh packages) — use TF axes |
+| **TF** | disabled on host | enable only if needed; costs Jetson RAM |
 
 If Map says **"no map received"**: check Durability is Transient Local;
 drive until `/map` width/height > 0; confirm host sees `/map` with
@@ -391,7 +571,7 @@ follow-up to this doc.
   `frame_id:=laser_link`.
 - Include `scan_front_filter` node (publishes `/scan_filtered`).
 - Include `slam_toolbox`'s `online_async_launch.py` with
-  [`config/mapper_params_online_async.yaml`](config/mapper_params_online_async.yaml).
+  [`config/mapper_params_online_async.yaml`](../yahboomcar_bringup/param/mapper_params_online_async.yaml).
 - RViz on host only (document env vars); do not start RViz on Jetson.
 
 **Why a separate launch file vs reusing `cat_patrol.launch.py`?**
@@ -414,6 +594,9 @@ Likely failures, sorted by how often they bite, with one-line fixes.
 | Map display "no map received" in RViz | QoS mismatch (`/map` is Transient Local) or empty 0×0 map before driving | Map display: Topic `/map`, Durability **Transient Local**. Drive 30 s; check `width`/`height` on Jetson. |
 | LaserScan "could not transform laser_link to map" | TF not ready, SLAM not up, or host not receiving `/tf` | Wait 20 s after SLAM start; host `ROS_DOMAIN_ID=28`; `ros2 run tf2_ros tf2_echo map laser_link` on host. |
 | `slam_toolbox` dies `exit code -9` | OOM on 8 GB Jetson | Use our lighter params file; close host RViz while SLAM starts; don't run default upstream params. |
+| `yahboom_joy_X3` dies `exit code -9` + `Bad alloc` in bringup terminals | Full stack + host RViz exceeded 8 GB RAM; DDS graph corrupted | **Full restart** (all Jetson terminals + close host RViz). Wait 10 s. Restart T1→T2→T2b→T3; wait 30 s; check `free -h` ≥ 2 GiB; then RViz. Joystick dead until T1 restarted. |
+| `cmd_vel timeout 0.64s > 0.60s, forcing stop` | Safety watchdog: no `/cmd_vel` for 0.6 s | **Normal when idle** (not touching stick). Also appears after `joy_node` OOM kill — consequence, not cause. |
+| `ekf_node Failed to meet update rate` | EKF configured faster than CPU can run under full stack | Default now **10 Hz** (was 30). Harmless if occasional; spam + `exit -9` = OOM → full restart. |
 | Joystick no motion | `driver_node` crashed, or old enable-button workflow | `ros2 node list \| grep driver`; sticks work without Start (Start = buzzer on this pad). |
 | Robot very slow | Low battery | Charge; check `/voltage`. |
 | Host `ros2` daemon errors | Stale Jazzy daemon on peter-pen | `pkill -9 -f ros2cli.daemon`; use `ros2 --no-daemon topic list`. |
@@ -429,6 +612,45 @@ Likely failures, sorted by how often they bite, with one-line fixes.
 | `slam_toolbox` logs "Message Filter dropping message" | Normal at startup while TF tree settles | Ignore unless it persists more than ~5 seconds. |
 | Mapping seems to do nothing after a long drive | TF chain broken or SLAM not getting scans | `ros2 run tf2_ros tf2_echo map odom`; `ros2 topic hz /scan_filtered`; confirm T2b filter running. |
 | Robot doesn't move on `i` press | cmd_vel watchdog has stopped motors | Press `i` more firmly. Watchdog re-arms on first cmd_vel. |
+
+### Why OOM keeps happening (8 GB Jetson budget)
+
+**Measured on this robot (EKF + IMU ON):**
+
+| Stage | RAM used | Notes |
+|---|---|---|
+| T1 + T2 + filter (no SLAM) | **~250 MiB** | Not 2 GB — bringup is cheap |
+| `slam_toolbox` starting | **~1.0–1.5 GiB** | This is the cliff |
+| Host RViz joining network | **+300–500 MiB** on Jetson | DDS + `/tf` fan-out |
+| ollama + Cursor + swap thrash | **+0.5–1.5 GiB** | Same Jetson you SSH from |
+
+So if you had **~2 GiB free** before SLAM, SLAM alone can take most of it; opening RViz at the same time pushes over the edge → `exit -9`.
+
+**We keep EKF + IMU.** Other mitigations:
+- **Reboot** if swap > 512 MiB (your Jetson often has ~1.2 GiB swapped after failed runs)
+- `sudo systemctl stop ollama` before mapping (not robot nodes)
+- Fast-DDS profile (`fastdds_mapping.xml`) — set by `slam_mapping.launch.py`
+- **Host RViz last**, 30 s after SLAM; **disable TF display** (Map + LaserScan only)
+- Lighter SLAM yaml (already applied)
+
+**Mitigations (no `cat_patrol_robot` required for mapping):**
+- Manual T1→T2→T2b→T3 (see section 10) — uses `yahboomcar_bringup` + `sllidar_ros2` + `slam_toolbox` only
+- Optional one-liner: `ros2 launch yahboomcar_bringup slam_mapping_X3_launch.py`
+- Reboot if swap > 512 MiB; stop ollama before mapping
+- Host RViz last; Map + LaserScan only (no TF display)
+- Lighter SLAM yaml in `yahboomcar_bringup/param/mapper_params_online_async.yaml`
+
+### OOM recovery (when bringup shows `Bad alloc` or joy `exit -9`)
+
+Once `Bad alloc` appears, **do not** keep running — DDS state is unreliable.
+
+1. Ctrl+C **all** Jetson terminals (T1–T3) and **close** host RViz.
+2. Wait 10 s; optionally `pkill -9 -f ros2` on Jetson if anything stuck.
+3. Confirm memory recovered: `free -h` → `available` should be **> 5 GiB**.
+4. **Restart:** T1→T2→T2b→T3 (section 10), or `ros2 launch yahboomcar_bringup slam_mapping_X3_launch.py`
+5. In RViz use **minimal displays**: Map + LaserScan only — **disable TF display** (TF over WiFi is a major Jetson RAM/CPU hit).
+
+The first `cmd_vel timeout` lines right after T1 start are **normal** (no stick input yet).
 
 ---
 
@@ -578,26 +800,61 @@ deeper concepts in section 8 you can ask me about):
 
 ## 10. Commands cheat-sheet
 
-Copy-paste-ready commands. On the **Jetson**, source both setup files in
-any new terminal. On the **host**, use Jazzy + `ROS_DOMAIN_ID=28`.
+**Tomorrow:** follow **section 4 → "Tomorrow — start here"** first.
+This section is the same commands in compact form.
+
+Copy-paste-ready. On the **Jetson**, always:
+
+```bash
+export ROS_DOMAIN_ID=28
+source /opt/ros/humble/setup.bash
+source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
+```
+
+On the **host**: Jazzy + `ROS_DOMAIN_ID=28` + `ROS_LOCALHOST_ONLY=0`.
+
+### 0. Pre-flight (Jetson, once per session)
+
+```bash
+free -h
+sudo systemctl stop ollama    # optional, recommended
+for d in /dev/ttyUSB*; do
+  pid=$(udevadm info -q property -n "$d" 2>/dev/null | grep '^ID_MODEL_ID=' | cut -d= -f2)
+  [ "$pid" = "7523" ] && echo "CHASSIS=$d"
+done
+readlink -f /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+```
 
 ### Verify installation (Jetson)
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 pkg prefix slam_toolbox
 ros2 pkg prefix nav2_map_server
-ros2 pkg executables cat_patrol_robot | grep scan_front_filter
+ros2 pkg executables yahboomcar_bringup | grep scan_front_filter
+```
+
+### Optional all-in-one (Jetson, replaces T1+T2+T2b+T3)
+
+```bash
+export ROS_DOMAIN_ID=28
+source /opt/ros/humble/setup.bash
+source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
+ros2 launch yahboomcar_bringup slam_mapping_X3_launch.py \
+    chassis_serial_port:=/dev/ttyUSB0 \
+    trim_vy_per_vx:=0.012
 ```
 
 ### Bringup — Jetson terminal 1
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch yahboomcar_bringup yahboomcar_bringup_X3_launch.py \
-    chassis_serial_port:=/dev/ttyUSB1 \
+    chassis_serial_port:=/dev/ttyUSB0 \
     use_joystick:=true \
     trim_vy_per_vx:=0.012
 ```
@@ -608,6 +865,7 @@ Joystick caps (defaults): `joy_xspeed_limit=0.15`, `joy_yspeed_limit=0.15`,
 ### LiDAR — Jetson terminal 2
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch sllidar_ros2 sllidar_launch.py \
@@ -619,21 +877,23 @@ ros2 launch sllidar_ros2 sllidar_launch.py \
 ### Scan filter — Jetson terminal 2b (**required**)
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
-ros2 run cat_patrol_robot scan_front_filter
+ros2 run yahboomcar_bringup scan_front_filter
 ```
 
-Fallback if `No executable found`: `chmod +x ~/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/scripts/scan_front_filter`
+Fallback if `No executable found`: rebuild `yahboomcar_bringup`
 
 ### slam_toolbox — Jetson terminal 3 (**always use lighter params**)
 
 ```bash
+export ROS_DOMAIN_ID=28
 source /opt/ros/humble/setup.bash
 source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 ros2 launch slam_toolbox online_async_launch.py \
     use_sim_time:=false \
-    slam_params_file:=/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/config/mapper_params_online_async.yaml
+    slam_params_file:=/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_bringup/param/mapper_params_online_async.yaml
 ```
 
 ### RViz — **host** terminal 4
@@ -722,7 +982,29 @@ and findings, not narration.
   - Joy speed capped at 0.15 m/s via bringup launch args
 - Outcome: map not saved yet; resume after charge
 
-### Session 2 — _date_
+### Session 2 — 2026-06-21 (OOM when host RViz started)
+
+- Stack: T1–T3 running; opened host RViz → bringup T1 showed cascade
+- Symptoms: `yahboom_joy_X3 exit -9`, `Bad alloc` in multiple nodes,
+  `ekf_node Failed to meet update rate` spam
+- Cause: 8 GB Jetson RAM exhausted (bringup + lidar + filter + SLAM + DDS
+  load when host RViz joined)
+- Recovery: full restart all terminals; wait 30 s after SLAM before RViz;
+  check `free -h` ≥ 2 GiB available first
+- Outcome: _(resume after full restart)_
+
+### Session 3 — 2026-06-21 (stopped for day — resume tomorrow)
+
+- Status: mapping not completed; no map saved yet
+- Next run: section 4 **"Tomorrow — start here"** (verify USB ports first)
+- Key fixes since session 2:
+  - `scan_front_filter` moved to `yahboomcar_bringup` (not `cat_patrol_robot`)
+  - Chassis port may be `/dev/ttyUSB0` (verify with CH340 7523 loop)
+  - LiDAR stays on CP2102 by-id symlink
+  - EKF + IMU kept; OOM mitigated by reboot/stop ollama/Rviz last/no TF display
+- Outcome: _(pending)_
+
+### Session 4 — _date_
 
 (copy template above)
 

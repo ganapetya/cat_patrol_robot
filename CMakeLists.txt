@@ -41,7 +41,6 @@ install(PROGRAMS
   scripts/enable_bt_a2dp.sh
   scripts/mail_node
   scripts/check_active_config.sh
-  scripts/scan_front_filter
   DESTINATION lib/${PROJECT_NAME})
 
 ament_python_install_package(${PROJECT_NAME})
