@@ -20,6 +20,20 @@ now records Session 1 (in progress). Use this doc as the canonical
 command reference — especially `/scan_filtered`, the lighter SLAM
 params, and host-side RViz.
 
+> **⚑ STATUS 2026-06-26 — Phase 1 mapping WORKS.** Two things changed since the
+> early sessions in §11, both documented in the new **§13–§15**:
+> 1. **Root cause found & fixed** for the long-running map "collapse/bowtie":
+>    the **RPLiDAR A1 was mounted ~180° rotated vs the URDF**, so the scan filter
+>    was keeping the robot's *rear* (antennas/wires) and discarding the clean
+>    front. Fixed via a 180° yaw in the URDF + a rewritten scan filter (§13a).
+> 2. **Architecture moved:** `slam_toolbox` **and** RViz now run on the **host PC
+>    inside a Humble Docker container** — not on the Jetson. The Jetson-side
+>    `slam_toolbox` steps in §4/§10 are **superseded by §13e–§13h**. The Jetson
+>    now runs sensors + odom + TF only.
+>
+> New readers: read **§13 (architecture & connectivity)** and **§15 (lessons
+> learned)** first, then use §4/§10 only for the Jetson sensor/odom stack.
+
 ---
 
 ## 1. Purpose and scope
@@ -1053,3 +1067,249 @@ and findings, not narration.
 - **`slam_toolbox` lifelong mode.** Continuously update the map
   across sessions. Mentioned for context; Phase 1 uses online async
   for simplicity. Lifelong is a Phase 7 polish item.
+
+---
+
+## 13. UPDATE 2026-06-26 — Phase 1 solved; SLAM moved to the host
+
+Phase 1 mapping now produces correct, non-smeared maps. This section supersedes
+the Jetson-side `slam_toolbox` instructions in §4/§10.
+
+### 13a. Root cause of the map "collapse": the LiDAR was mounted ~180° rotated
+
+**Symptom.** Driving a rectangle produced a map that **collapsed into a diagonal
+"bowtie"** — the four perpendicular legs rotated onto one axis, walls smeared. It
+happened with scan matching ON at *any* field of view (even full 360°), yet
+**pure-odometry mapping** (`use_scan_matching: false`) kept correct perpendicular
+geometry.
+
+**Diagnosis path** (each step eliminated a suspect):
+1. **Odometry is good** — a driven 90° turn moved `/odom` yaw ~90° (IMU-sourced),
+   a 1.0 m drive read 1.03 m. Not odom.
+2. **Filter doesn't re-stamp** — `scan_front_filter` copies the header
+   (`out.header = msg.header`), preserving capture time.
+3. **No clock skew** — Jetson/host agree in UTC epoch (NTP). Timezones were
+   mismatched but that's display-only (fixed anyway: both Asia/Jerusalem, RTC UTC).
+4. **FOV is not it** — collapse happens at full 360° too.
+5. **Known-object test (smoking gun)** — an object at the robot's *true front*
+   showed up in raw `/scan` at **~180°**, not 0°. → **laser-0° points to the
+   robot's REAR.**
+
+**Why that single fact explained every symptom:**
+- `scan_front_filter` kept laser ±110° (around laser-0°) thinking it was the front,
+  but that is the robot's **rear** — exactly where the **antennas + wires** sit. So
+  SLAM was fed the antenna-contaminated rear and the clean front was discarded.
+- Those antenna/wire returns are **body-fixed** (move with the robot) → the
+  scan-matcher anchors on them and won't register rotation → **collapse**.
+- The identity `base_link→laser_link` TF (claiming laser-0° = front) also placed
+  points **reflected**: a fixed wall lands at `2·sensor − wall`, so it appears to
+  move at ~2× as the robot drives → smear.
+
+**The fix (two parts — the filter runs in raw device angles, *before* TF):**
+1. **URDF:** `laser_joint` rpy yaw = **π** in `yahboomcar_X3.urdf` (+ `.xacro`) so
+   kept points are placed in the correct direction.
+2. **Filter:** rewritten to a wrap-safe *trusted arc* — params `trusted_center`,
+   `trusted_halfwidth`; `t2.5.sh` now passes `trusted_center:=π`,
+   `trusted_halfwidth:=1.92` → keep clean front 220°, clear rear ~140° (antennas).
+
+Scan matching re-enabled → rectangle maps cleanly, no collapse.
+
+### 13b. Who runs where (current architecture)
+
+| Machine | Runs | Role |
+|---|---|---|
+| **Jetson** (Ubuntu 22.04, ROS 2 **Humble**) | `yahboomcar_bringup` (base_node, IMU filter, EKF→`/odom`, joy), `robot_state_publisher` (URDF→TF), `sllidar_ros2` (`/scan`), `scan_front_filter` (`/scan_filtered`) | sensors + odom + TF only |
+| **Host `peter-pen`** (Ubuntu 24.04, ROS 2 **Jazzy**) | Humble **Docker** containers: `humble-docker-slam-1` (`slam_toolbox`), `humble-docker-rviz-1` (`rviz2`) | mapping + visualization |
+
+### 13c. Why SLAM runs in a Humble *Docker* on a Jazzy host
+
+The host OS ships ROS 2 **Jazzy**; the robot runs **Humble**. They use **different
+DDS wire encodings (XCDR1 vs XCDR2) and are NOT wire-compatible** — running Jazzy
+`slam_toolbox` directly against the robot floods `serdata.cpp "invalid data size"`
+errors and drops every string-bearing message (`/rosout`, `/parameter_events`). So
+the host runs SLAM + RViz inside **Humble Docker containers** that speak the robot's
+wire format. Compose project: `/home/bots/humble-docker/` (services `slam`, `rviz`;
+both `network_mode: host`, `ipc: host`).
+
+### 13d. How cross-machine connectivity is enabled (DDS)
+
+- **One ROS graph across two machines:** every process exports
+  `ROS_DOMAIN_ID=28`, `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`,
+  `CYCLONEDDS_URI=file://…/cyclonedds.xml`, `ROS_LOCALHOST_ONLY=0`. Mismatch any one
+  and `ros2 node list` shows nothing across the link (this is the #1 "why can't I
+  see the topics" trap).
+- **CycloneDDS hardened for WiFi** (`/home/jetson/cyclonedds.xml` &
+  `/home/bots/cyclonedds.xml`): `<AllowMulticast>spdp</AllowMulticast>` (multicast
+  for discovery only, unicast for data — kills a retransmit storm that OOM-killed
+  bringup when a remote subscriber joined), bounded `<WhcHigh>500kB`, larger kernel
+  socket buffers via sysctl. **Read once at process start → after editing the xml,
+  restart all nodes** (mixed configs cause silent TF dropouts).
+- Containers bind-mount the same xml: `-v /home/bots/cyclonedds.xml:/cfg/...:ro`.
+
+### 13e. The TF chain (who publishes each link, on which machine)
+
+| Transform | Published by | Machine |
+|---|---|---|
+| `map → odom` | `slam_toolbox` (drift correction) | **Host** container |
+| `odom → base_footprint` | `ekf_filter_node` (robot_localization) | Jetson |
+| `base_footprint → base_link → laser_link` | `robot_state_publisher` (from URDF) | Jetson |
+
+**Key insight:** `slam_toolbox` consumes the `…→laser_link` transform from `/tf` /
+`/tf_static` over DDS — **it never reads a URDF**. So the lidar-flip fix lives
+entirely in the Jetson URDF and the TF it broadcasts; nothing on the host needs the
+URDF for SLAM to be correct (the host RViz robot *mesh* is cosmetic). Because
+`laser_joint` is *fixed*, it's on **`/tf_static`** (latched/transient_local) — so
+**restart slam AFTER restarting bringup** so it picks up the corrected static TF.
+
+### 13f. Host Docker — inspect / edit params / restart
+
+- SLAM params: **`/home/bots/slam_params/mapper_params_host.yaml`**, bind-mounted
+  read-only to `/slam_params` in the container; launched
+  `ros2 launch slam_toolbox online_async_launch.py slam_params_file:=/slam_params/mapper_params_host.yaml`.
+- Inspect live params (from any domain-28 cyclonedds shell): `ros2 param dump /slam_toolbox`
+- Edit + apply: change the host yaml → `cd ~/humble-docker && sudo docker compose restart slam`
+  (restart also **clears the accumulated map** — good for a fresh run).
+- Containers/mounts: `sudo docker ps`,
+  `sudo docker inspect humble-docker-slam-1 --format '{{json .Mounts}}'`.
+
+### 13g. Screenshot / debug workflow (Jetson has no display)
+
+- The map/RViz live on the host; capture screenshots there and copy to the Jetson:
+  `scp /home/bots/Pictures/Screenshots/imNN.png jetson@192.168.0.120:~/viz_images/`.
+- Reusable diagnostics on the Jetson at **`/home/jetson/slam_debug/`**:
+  `raw_closest.py` (closest raw-scan returns by angle — the known-object test),
+  `yaw_mon.py` (compare `/odom` vs `/imu` vs wheel yaw), `pos_mon.py` (odom vs wheel
+  position), `diag.py` (scan/odom stamp ages + scan content). Run with the
+  domain-28 cyclonedds env; pipe with `python3 -u … > file` (ROS stdout buffers).
+
+### 13h. Updated startup order (supersedes §4/§10 Jetson-SLAM)
+
+Scripts in `~/myscripts2/` already carry the domain-28 + cyclonedds env.
+
+1. **Jetson `t1.sh`** — bringup (chassis, IMU, EKF→`/odom`, joy, robot_state_publisher).
+   Restarting **zeroes odom** so the map starts centered.
+2. **Jetson `t2.sh`** — lidar (`/scan`).
+3. **Jetson `t2.5.sh`** — `scan_front_filter` (`/scan_filtered`, `trusted_center=π`).
+4. **Host** — `cd ~/humble-docker && sudo docker compose restart slam`
+   (and `docker compose up rviz` after `xhost +local:root`).
+
+---
+
+## 14. Phase 1 status log — Session 2026-06-26 (RESOLVED)
+
+- **Architecture:** SLAM + RViz on host (Humble Docker); Jetson = sensors/odom/TF.
+- **Root cause** of the long-running map collapse/bowtie: **LiDAR mounted ~180° vs
+  the URDF** → `scan_front_filter` kept the rear antenna/wire cone → scan-matcher
+  anchored on body-fixed antennas → couldn't register rotation → collapse.
+- **Fix:** URDF `laser_joint` yaw = π + `scan_front_filter` rewritten to a wrap-safe
+  trusted arc (`trusted_center=π`, `trusted_halfwidth=1.92`). Scan matching ON again.
+- **Also earlier this session:** EKF retuned to take **heading from IMU only** (X3
+  wheel rotation is unreliable); verified driven 90° turn ≈ 90° in `/odom`, 1 m drive
+  ≈ 1.03 m. Jetson timezone aligned to host (Asia/Jerusalem, RTC UTC).
+- **Outcome:** rectangle drives map **cleanly, no smear.**
+- **Next:** re-enable `do_loop_closing: true`, loosen the conservative matcher
+  params (`correlation_search_space_dimension` 0.3→0.5, `coarse_search_angle_offset`
+  0.2→0.349, penalties back to defaults), drive a full room, save the `.pgm`/`.yaml`
+  to meet the §2 acceptance criteria.
+
+---
+
+## 15. Lessons learned — study tables
+
+A curriculum distilled from what Phase 1 actually exercised. Columns: **Topic** ·
+**What we hit / why it matters** · **Go deeper**. Pick a row, ask me to teach it.
+
+### 15a. ROS 2 core
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| Nodes, topics, pub/sub | The whole stack is nodes exchanging messages; `ros2 node list`/`topic list` were the first debugging reflex | `ros2 topic info -v`, message_filters |
+| QoS profiles | `/map` is **transient_local** (latched) → late subscribers still get it; `/scan`,`/odom` are volatile/best-effort. A QoS mismatch = silent "no data" | Reliability, Durability, History, depth; RMW QoS compatibility matrix |
+| Parameters | `slam_toolbox` is tuned entirely via params; we read them live with `ros2 param dump`, changed behavior without code | declare/get, param files (YAML), `ros2 param set`, param callbacks |
+| Launch files | `xacro` is run on the URDF at launch; bringup composes many nodes | `IncludeLaunchDescription`, `LaunchConfiguration`, `OpaqueFunction`, `Command` substitution |
+| `ros2 run` vs `ros2 launch` | We ran the filter via `ros2 run … --ros-args -p k:=v`; bringup via launch | console_scripts entry points, `--ros-args` remap/param syntax |
+| Time | message **header.stamp** (epoch) vs wall clock; `use_sim_time` | `rclpy`/`rclcpp` Time & Duration, sim time |
+| ament/colcon build | `--symlink-install` made Python edits live; we rebuilt one package; egg-link editable install | overlay vs underlay, `--packages-select`, build/install/log layout |
+
+### 15b. TF2 & coordinate frames
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| The TF tree | `map→odom→base_footprint→base_link→laser_link` spans two machines; one wrong link broke SLAM | `tf2_tools view_frames`, `tf2_echo` |
+| Static vs dynamic TF | `laser_joint` is fixed → `/tf_static` (latched); needed careful restart ordering | `static_transform_publisher`, transient_local on `/tf_static` |
+| TF at a timestamp | scan-matching needs the pose at the *scan's* stamp; WiFi lag vs `transform_timeout` dropped scans | tf2 buffer, interpolation, extrapolation, `lookupTransform` |
+| Frame conventions (REP-103/105) | x-forward, y-left, z-up, CCW yaw; **the lidar 180° flip was a frame-convention bug** | REP-103, REP-105, right-hand rule |
+| Mounting transforms in URDF | the fix was literally a joint `rpy` yaw=π | URDF `<joint>` origin, xacro macros |
+
+### 15c. Sensors & messages
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| `sensor_msgs/LaserScan` | `angle_min/max/increment` (sign = handedness), `ranges[]`, `scan_time`; the known-object test read the angle of a return | how slam_toolbox consumes each field; intra-scan motion distortion |
+| Scan handedness/orientation | positive `angle_increment` = CCW; raw angle 0 turned out to be robot-rear | A1 spins clockwise physically; driver maps to ROS CCW |
+| `nav_msgs/Odometry` | compared `/odom` (EKF) vs `/odom_raw` (wheel); quaternion→yaw | pose vs twist, covariance, child_frame_id |
+| `sensor_msgs/Imu` | gyro `angular_velocity.z` drove heading; bias at rest tiny | orientation vs angular_velocity, madgwick filter |
+| Quaternions ↔ yaw | converted constantly while debugging headings | `tf_transformations`, atan2 form, gimbal-free reasoning |
+
+### 15d. SLAM (slam_toolbox / Karto)
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| Online async mapping | our mode; builds occupancy grid + pose graph live | sync vs async vs lifelong vs localization modes |
+| Scan matching | the part that **collapsed** the map; it rotates/translates scans to fit — and locks onto body-fixed points | Karto correlative scan matcher; `correlation_search_space_*`, `*_search_angle_offset` |
+| `use_scan_matching` on/off | turning it OFF (pure odom) isolated the bug — a key diagnostic | when to trust odom vs matcher |
+| Pose graph + back-end | nodes = scans, edges = matches; Ceres optimizes | front-end vs back-end, `ceres_*` params |
+| Loop closure | left OFF (8 GB + false-closure risk in repetitive space) | candidate search radius, match thresholds, why false closures are catastrophic |
+| OccupancyGrid | `/map`: free/occupied/unknown, resolution, origin, row-major `data[]` | world↔grid conversion, log-odds updates, free-space rays |
+| `map→odom` as correction | how SLAM corrects EKF drift without touching odom | composition with the TF tree |
+| map_saver / serialize | `.pgm`+`.yaml` for nav; `.posegraph` to resume | `nav2_map_server`, SerializePoseGraph |
+
+### 15e. Sensor fusion & odometry (robot_localization EKF)
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| EKF config vectors | `odom0_config`/`imu0_config` 15-bool masks decided we fuse wheel **velocity** + IMU **yaw** only | robot_localization params, `two_d_mode` |
+| Why heading from IMU | X3 wheel rotation is unreliable (~dead in-place); IMU gyro is accurate | dead-reckoning error sources, mecanum slip |
+| Verifying odom empirically | driven-turn & 1 m-drive tests (`yaw_mon.py`, `pos_mon.py`) proved odom before blaming it | controlled experiments, ground-truth checks |
+| `reset_on_time_jump` | why the Jetson "RTC in local TZ" was a latent hazard | clock jumps & filter resets |
+
+### 15f. DDS / middleware / multi-machine
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| RMW abstraction | nodes were invisible until shell used `rmw_cyclonedds_cpp` + domain 28 | rmw layer, FastDDS vs CycloneDDS |
+| `ROS_DOMAIN_ID` | the stack lives on **28**, not 0 — wrong domain = empty graph | domain → UDP port mapping |
+| CycloneDDS config | hardened xml fixed WiFi OOM (spdp multicast, WhcHigh, sysctl buffers) | CycloneDDS XML, discovery vs data, writer history cache |
+| Cross-distro wire (in)compat | Humble↔Jazzy not wire-compatible → Humble Docker on host | XCDR1 vs XCDR2, type hashes |
+| Discovery & services | `ros2 param dump` succeeding **proved** the remote node was alive | SPDP/SEDP discovery, request/response services |
+
+### 15g. Docker & cross-distro ops
+
+| Topic | What we hit / why it matters | Go deeper |
+|---|---|---|
+| Containerizing ROS | host runs SLAM/RViz in Humble images to match the robot | `network_mode: host`, `ipc: host` for DDS/shared-mem |
+| Bind mounts | params + cyclonedds.xml mounted read-only into the container | `docker inspect … Mounts`, `:ro` |
+| Compose lifecycle | `docker compose restart slam` applies params + clears map | services, restart vs up/down |
+| GUI from container | RViz needs `DISPLAY` + X11 socket + `xhost +local:root` | X forwarding, `/tmp/.X11-unix` |
+
+### 15h. Debugging methodology (the meta-lessons)
+
+| Lesson | What happened here |
+|---|---|
+| **Isolate variables one at a time** | scan-matching ON vs OFF split "placement" from "matching" and located the failure |
+| **Verify assumptions with a measurement, not a guess** | the known-object test beat three plausible theories (FOV, timestamps, odom) |
+| **Don't anchor on the first plausible cause** | "limited FOV" looked right and was wrong; the user's "is front actually back?" cracked it |
+| **Rule things out cheaply first** | odom, clock, re-stamping checked before touching the matcher |
+| **Trust the data over the model** | TF *said* identity; reality was 180° off — the URDF only encodes an assumption |
+| **Make diagnostics reusable** | the `slam_debug/` scripts are kept for next time |
+
+### 15i. C++ for ROS (reading real nodes — no writing required)
+
+| Target | What to learn |
+|---|---|
+| `slam_toolbox` `src/slam_toolbox_async.cpp` | production node shape: lifecycle, callback groups, param callbacks, multi-threaded executor |
+| Karto wrapper in slam_toolbox | integrating a third-party C++ lib into a ROS 2 node |
+| `nav2_map_server` | OccupancyGrid ↔ `.pgm`/`.yaml` file I/O alongside ROS messages |
+| `robot_localization` `ekf_filter_node` | how the EKF composes with the TF tree once `map→odom` is added |
+| this workspace `base_node_X3.cpp` | the dead-reckoning math that explains why X3 wheel yaw is unreliable |
+| this workspace `scan_front_filter.py` | smallest possible sub→process→pub node; the trusted-arc + wrap-normalize logic |
