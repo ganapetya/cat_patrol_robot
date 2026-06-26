@@ -1,0 +1,39 @@
+services:
+  slam:
+    build: .
+    image: humble-tools
+    network_mode: host          # share host net -> sees wlx7898e8c2016f + DDS
+    ipc: host                   # required for DDS shared memory
+    environment:
+      ROS_DOMAIN_ID: "28"
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      CYCLONEDDS_URI: file:///cfg/cyclonedds.xml
+    volumes:
+      - /home/bots/cyclonedds.xml:/cfg/cyclonedds.xml:ro
+      - /home/bots/slam_params:/slam_params:ro
+    command: >
+      ros2 launch slam_toolbox online_async_launch.py
+      slam_params_file:=/slam_params/mapper_params_host.yaml
+      use_sim_time:=false
+
+  rviz:
+    build: .
+    image: humble-tools
+    network_mode: host
+    ipc: host
+    environment:
+      ROS_DOMAIN_ID: "28"
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      CYCLONEDDS_URI: file:///cfg/cyclonedds.xml
+      DISPLAY: "${DISPLAY}"             # <-- the GUI bridge
+      QT_X11_NO_MITSHM: "1"
+      AMENT_PREFIX_PATH: /opt/desc/yahboomcar_description:/opt/ros/humble
+    volumes:
+      - /home/bots/cyclonedds.xml:/cfg/cyclonedds.xml:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw   # <-- the X socket
+      - /home/bots/all/yahboomcar_ros2_ws/yahboomcar_ws/src/yahboomcar_rviz/rviz:/rviz:ro
+      - /home/bots/all/yahboomcar_ws/install/yahboomcar_description:/opt/desc/yahboomcar_description:ro
+    devices:
+      - /dev/dri:/dev/dri                 # GPU direct rendering (optional)
+    command: >
+      ros2 run rviz2 rviz2
