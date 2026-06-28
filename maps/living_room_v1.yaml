@@ -1,4 +1,4 @@
-image: /home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/maps/living_room_v2.pgm
+image: /home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/maps/living_room_v1.pgm
 mode: trinary
 resolution: 0.05
 origin: [-2.76, -2.96, 0]
