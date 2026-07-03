@@ -1,7 +1,5 @@
 # Phase 0 — Status & Reference
 
-[Google Doc of learning material for the phase 0](https://docs.google.com/document/d/1MdjIR7VsIDVTOT6noHQWUqswjvca93G5HCrSGA-LRaQ/edit?usp=sharing)
-
 Companion to `plan.md`. This is the practical, "what did we actually do
 today" document — file inventory, command cheat-sheet, observed topics, and
 lessons learned. Read alongside `plan.md` (which has the project arc) and

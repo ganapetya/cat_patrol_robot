@@ -19,6 +19,12 @@ The project is sized in phases so that finishing each one feels like a real
 milestone rather than a chore. Phase 0 (sensor and odometry foundation work)
 is complete; Phase 1 (room mapping with `slam_toolbox`) is up next.
 
+## Learning ,important documentation
+
+[google doc, explaining details](https://docs.google.com/document/d/1MdjIR7VsIDVTOT6noHQWUqswjvca93G5HCrSGA-LRaQ/edit?usp=sharing)
+
+
+
 ## Hardware platform
 
 The chassis is a **Yahboom X3** with the standard expansion stack on top:
@@ -45,9 +51,6 @@ The full step-by-step execution plan, with C++/ROS 2 learning goals for
 each phase and "done-when…" criteria, lives in:
 
 - **[plan.md](plan.md)** — the project plan, phase by phase
-- **[phase0-status.md](phase0-status.md)** — what was actually done in Phase
-  0: files created/modified, topics observed, commands used, lessons
-  learned, calibration record
 - **[hardware.md](hardware.md)** — full hardware reference: power flow,
   boards, sensors, port assignments, topic map, known limitations,
   empirical calibration values for *this specific unit*
