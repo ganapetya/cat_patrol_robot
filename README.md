@@ -1,7 +1,6 @@
 # Cat Patrol Robot
 
 <p align="left">
-  <img src="images/botcat.JPG" width="200" alt="The robot meeting a cat" />
   <img src="images/botph.jpeg" width="200" alt="The robot, side view" />
 </p>
 
