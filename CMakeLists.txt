@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -33,6 +35,12 @@ ament_target_dependencies(patrol_node
 target_link_libraries(patrol_node ${OpenCV_LIBS})
 
 install(TARGETS patrol_node DESTINATION lib/${PROJECT_NAME})
+
+add_executable(nav_goal_client_node src/nav_goal_client_node.cpp)
+ament_target_dependencies(nav_goal_client_node
+  rclcpp rclcpp_action nav2_msgs geometry_msgs
+)
+install(TARGETS nav_goal_client_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch systemd DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/run_cat_patrol.sh

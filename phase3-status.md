@@ -871,19 +871,101 @@ ros2 run tf2_tools view_frames
 
 ## 11. Phase 3 session log
 
-### Session 1 — _date_
+### Session 1 — 2026-07-04
 
-- Build SHA / colcon clean: _(yes/no)_
-- Battery start / end:
-- All nav nodes reached active: yes/no
-- Milestone 1 (RViz goal) — path planned around walls: yes/no
-- Milestone 1 — stopped within tolerance: yes/no, measured ___ cm
-- AMCL stayed converged while driving: yes/no
-- Milestone 2 (C++ client) — succeeded printed: yes/no
-- Milestone 2 — aborted / canceled paths tested: yes/no
-- Inflation radius that worked: ___
-- max_vel_x that felt right: ___
-- Anything unusual:
+- Build SHA / colcon clean: **yes** — all §4 files created, `cat_patrol_robot`
+  built clean, `nav_goal_client_node` registered, `navigation.launch.py` reachable.
+- All nav nodes reached active: **yes** (after the BT-XML fix below).
+- Milestone 1 (RViz goal) — path planned around walls: **yes**
+- Milestone 1 — stopped within tolerance: **yes** — "**Milestone 1 reached**".
+- AMCL stayed converged while driving: **mostly** — degraded once after a bringup
+  restart (see Finding C).
+- Milestone 2 (C++ client) — succeeded printed: **partial** — node builds & runs and
+  sends goals; the three result paths (succeeded / aborted / canceled) and the real
+  `async_cancel_goal` cancel were **not yet fully exercised**. Carry to Session 2.
+- max_vel_x that felt right: **0.10** (crawl — traction over speed; see Finding D).
+- Anything unusual: **yes — lots.** See "Session 1 findings & fixes" below.
+
+### Session 1 findings & fixes (real-world issues hit)
+
+These are the non-obvious things that cost time. Read before Session 2.
+
+**Finding A — `bt_navigator` needs an ABSOLUTE path to the BT XML.**
+A bare filename (`navigate_to_pose_w_replanning_and_recovery.xml`) fails with
+`Couldn't open input XML file` and the whole `lifecycle_manager_navigation`
+aborts bringup. Fixed in `nav2_params.yaml` by pointing
+`default_nav_to_pose_bt_xml` / `default_nav_through_poses_bt_xml` at the full
+`/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/…xml` paths.
+
+**Finding B — the joystick floods `/cmd_vel` and blocks Nav2 (THE big one).**
+With the stock bringup (`use_joystick:=true`), `yahboom_joy_X3` publishes a
+zero-`Twist` **3× per joystick callback**, and `joy_node` autorepeats ~19 Hz →
+**~57 Hz of zeros on `/cmd_vel`**. Nav2's `controller_server` publishes at only
+10 Hz, so the base's last-received command is almost always a joystick zero →
+robot barely twitches → `controller_server: Failed to make progress` → recovery
+`backup` also fails. The plan's assumption ("joystick = safety override only")
+is **wrong for this bringup** — the joystick is wired straight onto `/cmd_vel`
+with no arbitration and *fights* Nav2.
+- **Fix used:** relaunch T1 with `use_joystick:=false` (the launch arg's own
+  description says "set false for autonomous patrol"). Then `/cmd_vel` has exactly
+  one publisher (`controller_server`) and the robot drives.
+- **Safe because:** `Mcnamu_driver_X3.py` has a **0.6 s cmd_vel watchdog**
+  (`cmd_timeout_sec`) — if `/cmd_vel` goes silent it forces `set_car_motion(0,0,0)`.
+  So Ctrl-C on T4 is a real e-stop (motors stop ≤0.6 s); no runaway.
+- **To regain the joystick as a true override later:** it needs (1) a ~15-line edit
+  to `yahboom_joy_X3.py` so it only publishes when a stick/deadman is active (stop
+  the idle-zero flood), then (2) a `twist_mux` giving the joystick priority. A plain
+  twist_mux alone does NOT work — the joy node's continuous zeros would still win.
+
+**Finding C — "costmap rotated vs walls" == AMCL heading error, not a Nav2 bug.**
+After restarting bringup (for Finding B), odom reset and the re-set 2D Pose
+Estimate had an off heading → AMCL locked onto a rotated pose → laser lands
+rotated onto the static map → obstacle layer looks rotated vs the walls →
+distant goals fail. The static walls come straight from `/map` and can't rotate;
+only the laser-placed layer can. Verified the laser TF is fine:
+`base_link → laser_link` yaw = **180.0°** (the intact `yaw=π` mounting fix, see
+[[project_slam_map_collapse]]). **Fix:** re-do 2D Pose Estimate carefully
+(heading is what matters), confirm `/scan_filtered` snaps onto the walls, nudge
+the robot (keyboard teleop, since joystick is off now) so AMCL tightens.
+
+**Finding D — traction: the robot can't turn in place on the slick floor (UNSOLVED).**
+Central ~2×2.3 m **carpet** area = grip is fine, drives and turns OK. **Beyond the
+carpet the floor is slippery** and in-place rotation fails: the point-turn
+(left wheels forward, right wheels backward) is pure sideways **scrubbing** with
+almost no rolling motion, so the wheels break static friction and spin without
+rotating the body. This is a **friction/physics limit**, not a tuning bug — no
+speed setting creates grip that isn't there.
+
+Mitigations applied (all in `nav2_params.yaml`, no rebuild — T4 restart reloads):
+1. **Tier 1 — crawl + gentle (DWB):** `max_vel_x 0.18→0.10`, `max_vel_theta 1.0→0.25`,
+   `acc_lim_x 2.5→0.5`, **`acc_lim_theta 0.5→0.10`** (the key lever — gentle
+   break-away keeps tires under the static-friction limit), tolerances tightened
+   to 0.15 for precision, and the progress checker **relaxed**
+   (`required_movement_radius 0.5→0.10`, `movement_time_allowance 10→25`) so crawl
+   speed doesn't trigger false `Failed to make progress` aborts.
+2. **Tier 2 — switched controller DWB → Regulated Pure Pursuit (RPP)** with
+   **`use_rotate_to_heading: false`** so it **never point-turns** — it arcs forward
+   through every turn (rolling traction ≫ scrubbing traction). DWB kept as a
+   commented fallback block in the same file (flip back = swap the two `FollowPath`
+   blocks + restart T4). Because RPP-without-in-place-rotation can't achieve a
+   *commanded* final heading, `yaw_goal_tolerance` was set to **3.14 (ignore yaw)**,
+   or goals would never complete — **position stays precise (0.15 m), final facing
+   is whatever the arc gives.**
+
+**Status: parked, still not ideal.** Turning on the slick floor is improved but
+not solved. Remaining options, in order of effort:
+- **Mechanical (real cure):** rubber O-rings / grip tape on the wheels, or a runner
+  rug along the patrol route. Scrubbing is a friction problem; grip fixes it everywhere.
+- **Option B — custom `/cmd_vel` pivot-shaper (~30-line node):** rewrite the
+  controller's near-pure-spin commands (`vx≈0, |ωz|>0`) into a **pivot turn**
+  `vx = |ωz| · track/2` (track ≈ 0.25 m → pivot radius ≈ 0.12 m) so the inner wheel
+  stops and the robot pivots about one side instead of scrubbing. Tighter than RPP's
+  arc; needs the controller loop to tolerate the added translation.
+- **RPP tuning:** if arcs are too wide for the room, tighten lookahead / min radius.
+
+**Config note:** all Phase 3 params live in `config/nav2_params.yaml`, read directly
+from the source tree by `navigation.launch.py` — **edits need only a T4 restart, no
+`colcon build`.** Only C++ (`nav_goal_client_node.cpp`) changes need a rebuild.
 
 ### Session 2 — _date_
 
@@ -1225,3 +1307,104 @@ The whole Phase 1+2+3 stack (`t1`→`t4`) becomes the fixed "navigation
 substrate." Phase 4 onward adds *application* logic (FSM, waypoints, capture,
 mail, cat reaction) that only ever talks to Nav2 through the action interface —
 never raw `/cmd_vel` again (plan.md rule).
+
+---
+
+## 14. C++ lessons to study (from `nav_goal_client_node.cpp`)
+
+> A study checklist to go over later. Every item below appears in the ~110-line
+> `src/nav_goal_client_node.cpp` — read the line, then the concept. Grouped from
+> "ROS 2 action plumbing" → "modern C++ / concurrency" → "next-phase extensions."
+> The recurring theme (plan.md): **react to work completing via callbacks/futures
+> instead of blocking the thread** — the `std::future` idea from *C++ Concurrency
+> in Action*, applied to a long-running robot action.
+
+### 14a. ROS 2 action-client mechanics
+
+- [ ] **`rclcpp_action::Client<ActionT>`** — the templated action-client type.
+      How it differs from a service client (streams feedback + is cancelable).
+- [ ] **`rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose")`**
+      — the factory; the node owns the client; the action *name* must match the
+      server (`bt_navigator`).
+- [ ] **`wait_for_action_server(5s)`** — discovery/handshake before sending; the
+      `5s` is a `std::chrono` literal (see 14c). What "server not available" means.
+- [ ] **`SendGoalOptions`** — the struct bundling the **three callbacks**:
+  - [ ] `goal_response_callback(GoalHandle::SharedPtr)` — **accept vs reject**; a
+        **null** handle means rejected. (Why a server would reject.)
+  - [ ] `feedback_callback(handle, shared_ptr<const Feedback>)` — the progress
+        stream (`distance_remaining`). Rule: **don't block here**, just react.
+  - [ ] `result_callback(WrappedResult)` — terminal outcome via
+        **`rclcpp_action::ResultCode`** switch: `SUCCEEDED` / `ABORTED` / `CANCELED`.
+- [ ] **`async_send_goal(goal, opts)`** — fire-and-react; returns a
+      **`std::shared_future<GoalHandle::SharedPtr>`** (the futures link, 14b).
+- [ ] **`ClientGoalHandle<ActionT>`** — the handle that represents the in-flight
+      goal; needed to query status and to **cancel** (14d).
+- [ ] **Action interface anatomy** — read `nav2_msgs/action/NavigateToPose.action`:
+      the `Goal` / `Result` / `Feedback` three-part message and how the generated
+      C++ types (`NavigateToPose::Goal`, `::Feedback`, `WrappedResult`) map to it.
+
+### 14b. The futures / concurrency connection (the core learning goal)
+
+- [ ] **`std::shared_future` vs `std::future`** — why `async_send_goal` returns a
+      *shared* future; multiple observers / copyable.
+- [ ] **Callbacks as continuations** — reacting to a future completing *without*
+      calling `.get()`. Contrast with **`rclcpp::spin_until_future_complete`**
+      (which blocks the executor — wrong here: it would freeze feedback + TF).
+- [ ] **Why not block?** The single executor thread must keep spinning to deliver
+      feedback, TF, and timers while the goal is in flight. Map this to
+      `std::future`/continuation reasoning in *C++ Concurrency in Action*
+      (`std::packaged_task`, `std::async`, `future.then`-style flow).
+- [ ] **Executor model** — `rclcpp::spin(node)` in `main`; how callbacks are
+      dispatched on it; where `rclcpp::shutdown()` (in `result_callback`) ends it.
+- [ ] **Deferred one-shot send** — `create_wall_timer(500ms, …)` then
+      `timer_->cancel()` inside the callback: *why* defer the send until the
+      executor is actually spinning (so the callbacks can fire).
+
+### 14c. Modern C++ idioms used
+
+- [ ] **Type aliases** — `using NavigateToPose = …;`
+      `using GoalHandle = rclcpp_action::ClientGoalHandle<NavigateToPose>;`
+      (taming long template names).
+- [ ] **`std::chrono` literals** — `using namespace std::chrono_literals;` →
+      `500ms`, `5s`. Where the `using` belongs and why.
+- [ ] **Lambdas with capture** — `[this](…){ … }` for each callback; capturing
+      `this` to call `get_logger()` / member state; lambda vs `std::bind`
+      (the timer uses `std::bind(&NavGoalClient::send_goal, this)` — compare).
+- [ ] **Smart pointers** — `std::make_shared<NavGoalClient>()`,
+      `SharedPtr` typedefs everywhere, `std::shared_ptr<const Feedback>`
+      (const-correct shared ownership). Node lifetime vs `shared_from_this`.
+- [ ] **Class-as-node pattern** — `class NavGoalClient : public rclcpp::Node`,
+      members initialized in the ctor, RAII ownership of client_/timer_.
+- [ ] **Parameters** — `declare_parameter` + `get_parameter(...).as_double()`;
+      typed access; passing `-p goal_x:=…` on the CLI.
+- [ ] **`<cmath>` + quaternion-from-yaw** — `std::sin(yaw/2)`, `std::cos(yaw/2)`;
+      why yaw→quaternion, and why `<cmath>` must be included (it was, deliberately).
+- [ ] **Logging macros** — `RCLCPP_INFO/WARN/ERROR(get_logger(), fmt, …)`;
+      printf-style formatting.
+
+### 14d. Extensions to implement next (study + do)
+
+- [ ] **`async_cancel_goal(handle)` — the cancel path (Milestone 2 + Phase 6).**
+      Currently Ctrl-C only calls `rclcpp::shutdown()`, so the *robot keeps driving*
+      even though the client exits. Wire a real SIGINT handler that calls
+      `async_cancel_goal`, waits for the `CANCELED` result, *then* shuts down. This
+      is the exact primitive Phase 6 reuses for **cancel-on-cat-sighting**.
+- [ ] **Store the `GoalHandle`** returned via the goal-response future so you can
+      cancel or query it later (needed for cancel + for goal sequencing).
+- [ ] **Callback groups / executors** — when Phase 4 chains multiple goals
+      (waypoint sequencer / FSM), how to avoid deadlocks: reentrant vs mutually-
+      exclusive callback groups, `MultiThreadedExecutor`.
+- [ ] **`NavigateThroughPoses`** — the multi-pose action (vs single
+      `NavigateToPose`); how the client code changes for a pose *list*.
+- [ ] **Result/feedback message fields** — beyond `distance_remaining`:
+      `navigation_time`, `number_of_recoveries`; using them for patrol telemetry.
+
+### 14e. Where to read the reference source (from §9)
+
+- [ ] `rclcpp_action/include/rclcpp_action/client.hpp` — `Client<>`,
+      `SendGoalOptions`, `async_send_goal`, `async_cancel_goal`.
+- [ ] `rclcpp_action/include/rclcpp_action/client_goal_handle.hpp` —
+      `WrappedResult`, `ResultCode`.
+- [ ] `nav2_msgs/action/NavigateToPose.action` — Goal/Result/Feedback fields.
+- [ ] `nav2_bt_navigator/src/bt_navigator.cpp` — the **server** side: how the
+      action is hosted and how the behavior tree drives planner + controller.
