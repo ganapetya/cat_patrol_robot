@@ -967,9 +967,92 @@ not solved. Remaining options, in order of effort:
 from the source tree by `navigation.launch.py` — **edits need only a T4 restart, no
 `colcon build`.** Only C++ (`nav_goal_client_node.cpp`) changes need a rebuild.
 
-### Session 2 — _date_
+### Session 2 — 2026-07-05  (controller A/B: MPPI; reverse + in-place-rotation experiments)
 
-_(copy template above)_
+**Focus:** evaluate alternative Nav2 controllers (esp. MPPI) and test two traction
+ideas on the slick floor — (B1) allow reverse, and (2) faster in-place rotation.
+
+> **⚠️ CONFIG LEFT IN A TEST STATE.** `config/nav2_params.yaml` was NOT reverted at
+> end of session. Before trusting normal behaviour next session, revert the params
+> tagged `ROTATION TEST` and decide on the `TEST B(1)` reverse params (see below).
+
+**Controller menu (verified installed on the Jetson, `/opt/ros/humble`):**
+DWB, RegulatedPurePursuit (RPP), **MPPI** (`nav2_mppi_controller`), and RotationShim
+are all present — no apt install needed. Switching = edit `nav2_params.yaml` +
+restart T4 (no rebuild). MPPI is now the **active** `FollowPath`; RPP and DWB are
+commented fallbacks in the same file.
+
+**Key facts learned about MPPI on this robot:**
+- MPPI in Humble is **CPU-vectorized (xtensor), NOT GPU-accelerated** — it never
+  touches the Orin GPU. Budget is CPU/RAM; kept `batch_size: 1000`, `time_steps: 30`.
+- **`model_dt` must be ≥ controller period** (`1/controller_frequency`). With
+  `controller_frequency: 10.0`, `model_dt: 0.05` → FATAL "Controller period more then
+  model dt". Fixed: `model_dt: 0.1` (== 0.1 s period). To go finer, raise freq to 20
+  and set `model_dt: 0.05` (≈2× CPU).
+- Why MPPI here: it's the only controller that does smooth forward-biased arcs
+  (good on slick floor, like RPP) AND real obstacle avoidance (like DWB) — resolves
+  the RPP-vs-DWB tension from Session 1.
+
+**Bring-up gotcha re-confirmed (not a bug):** after T4 launches, `global_costmap`
+spams `Timed out waiting for transform ... "map" ... frame does not exist`. Cause:
+**AMCL is active but unlocalized** → it doesn't publish `map→odom` until it gets an
+initial pose. Fix = set 2D Pose Estimate (or publish `/initialpose`). The costmap
+retries (INFO, not fatal) and activates once the transform appears; no T4 restart
+needed. Consider `set_initial_pose: true` in `amcl_params.yaml` for repeat runs.
+
+**Experiment B(1) — allow reverse (config currently ACTIVE):**
+Reverse needs THREE knobs, not just `vx_min` — the other two actively suppress it:
+- `vx_min: -0.10` (was 0.0) — the actual reverse-enable.
+- `PreferForwardCritic.enabled: false` (was true) — at weight 5.0 it suppresses reverse.
+- `PathAngleCritic.mode: 1` (NO_DIRECTIONAL_PREFERENCE) — else the 180° heading of
+  reverse is penalized.
+- ⚠️ **Rear is BLIND** (costmap = `/scan_filtered` front arc only) — reverse cannot
+  see obstacles behind. Not fully road-tested; test in open space, joystick in hand.
+
+**Experiment 2 — faster in-place rotation (config currently ACTIVE): FAILED, informative.**
+Raised `wz_max: 0.5→1.5`, `wz_std: 0.3→0.5`, `TwirlingCritic: 10→2` (so MPPI would
+spin in place instead of arcing).
+- **Result: instead of rotating, the robot drove SIDEWAYS ~90°.**
+- **Why (mecanum physics):** an in-place mecanum rotation is the sum of four 45°
+  roller forces whose *sideways* components cancel ONLY if all four wheels grip
+  equally. On the slick floor grip is unequal → the cancellation breaks → the
+  leftover diagonal components sum to a **net lateral force → the rotation bleeds
+  into a strafe.** Rotation and strafe are adjacent differential modes, so that's
+  where it leaks. On the carpet the same command rotates fine → confirms it's
+  **traction, not wiring**. "Faster spin" is disproven: more speed = more slip.
+- **User's "asymmetric wheel" idea** (e.g. right back x, left forward 4x) works out
+  to net `vx=1.5x forward + strong wz` = a **forward ARC/pivot**, NOT in-place. That's
+  the *right* instinct (wheels roll instead of scrub) — and Nav2 already produces it
+  as a normal `vx>0 + wz` command; no per-wheel control needed (`set_car_motion` only
+  takes vx,vy,wz). It equals the arc approach we already had (RPP `use_rotate_to_heading:
+  false` / MPPI with high `TwirlingCritic`).
+
+**CONCLUSION — in-place rotation on the bare floor is a dead end on this mecanum base;
+force it and it strafes. The robust answer is arc/pivot turning (wheels roll).**
+Two-mode plan (refined): NOT "spin faster off-carpet" but — **on carpet:** in-place
+rotation allowed; **off carpet:** arcs only (no in-place turn). Implement as a
+per-surface switch of `TwirlingCritic` weight / `use_rotate_to_heading`, once the
+carpet region is designated on the map. Mechanical grip (tape/rug) remains the real cure.
+
+**Also this session (non-controller):**
+- `~/myscripts2/t4_nav.sh` now runs `sudo systemctl stop ollama` before launch
+  (guarded, won't hang) — MPPI is the heaviest stack; removes the risk a stray LLM
+  query loads a multi-GB model mid-drive and OOM-kills `controller_server` (-9).
+  Idle ollama is only ~50 MB (no model resident), so it's insurance, not urgent.
+- **ollama is NOT part of cat detection.** Phase 5 = YOLOv8→TensorRT on GPU
+  (verified: TensorRT 10.7 + trtexec present). ollama serves LLMs (its 12 models are
+  mostly a leftover local *coding* assistant — starcoder2/deepseek-coder/codellama +
+  the "ollama + Cursor" note). Keep it stopped during patrol; on 8 GB unified memory a
+  7B model (4–5 GB) would blow the budget. Nice symmetry: Nav2/MPPI = CPU, YOLO = GPU.
+
+**TODO next session:**
+1. Decide + revert config: `ROTATION TEST` params back to `wz_max: 0.5`, `wz_std: 0.3`,
+   `TwirlingCritic: 10`. Keep or drop reverse B1 (`vx_min`, `PreferForwardCritic`,
+   `PathAngleCritic.mode`) — all tagged in `nav2_params.yaml`.
+2. Finish MPPI Milestone 1 acceptance (drive a goal, arc turns, stop in tolerance).
+3. Milestone 2 C++ client result paths (succeeded/aborted/canceled) still not exercised
+   (carried from Session 1).
+4. Build the carpet-vs-bare-floor mode switch (map region → TwirlingCritic/rotate mode).
 
 ### Final results
 
