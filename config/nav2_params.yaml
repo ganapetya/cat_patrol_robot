@@ -36,15 +36,13 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.10   # crawl speed won't cover 0.5 m in 10 s -> false abort
-      movement_time_allowance: 25.0    # give slow/gentle moves time before "no progress"
+      required_movement_radius: 0.5    # nav2 default (crawl-era 0.10 no longer needed)
+      movement_time_allowance: 10.0    # nav2 default (crawl-era 25.0 no longer needed)
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.15          # tight final POSITION (precision kept)
-      yaw_goal_tolerance: 0.5          # MPPI CAN settle a final heading via gentle arcing
-                                       # (unlike RPP w/ use_rotate_to_heading:false, which needed
-                                       # 3.14 to ignore yaw). Loose-ish to avoid slick-floor spin
-                                       # near the goal; tighten toward 0.25 if heading matters more.
+      xy_goal_tolerance: 0.15          # tight final POSITION
+      yaw_goal_tolerance: 0.25         # proper final heading — rotation works now
+                                       # (was 0.5 to dodge slick-floor spin; no longer needed)
       stateful: True
 
     # ========================================================================
@@ -124,57 +122,45 @@ controller_server:
 
     # ========================================================================
     # ACTIVE CONTROLLER: MPPI (Model Predictive Path Integral).
-    # Resolves the RPP-vs-DWB tension: samples many forward-biased rollouts AND
-    # does real obstacle avoidance, while PreferForward + Twirling critics
-    # suppress the in-place spin that breaks traction on the slick floor.
+    # Samples many forward-biased rollouts AND does real obstacle avoidance.
     #
     # NOTE: MPPI in Humble is CPU-vectorized (xtensor), NOT GPU-accelerated —
     # it will not touch the Orin's GPU. Budget is CPU/RAM. batch_size /
     # time_steps kept modest; watch `free -h` + a core's load (htop). Nav2 is
     # the heaviest stack (OOM -9 risk, §8) — stop ollama before launching.
     #
-    # -----------------------------------------------------------------------
-    # TEST A: forward-only. vx_min 0.0, PreferForwardCritic ON, PathAngleCritic mode 0.
-    #   (To restore Test A: revert the three "TEST B(1)" edits below.)
-    #
-    # >>> TEST B(1) ACTIVE NOW: reverse ALLOWED. vx_min -0.10, PreferForwardCritic OFF,
-    #     PathAngleCritic mode 1. Rear is BLIND (costmap = /scan_filtered front arc only) —
-    #     run in OPEN space, joystick in hand. Strafe still OFF (that's B(2)).
-    #
-    # TEST B (later — "not forward-only"): relax the constraints. Two knobs,
-    #   change independently so you know which did what:
-    #     (1) allow REVERSE:  set  vx_min: -0.10   (CAUTION: rear is blind —
-    #         costmap is /scan_filtered front arc only; robot can back into
-    #         unseen obstacles. Test in open space, joystick in hand.)
-    #     (2) allow STRAFE (true holonomic): set  motion_model: "Omni",
-    #         vy_max: 0.10, vy_std: 0.15  (CAUTION: reintroduces the mecanum
-    #         roller slip on the smooth floor — Finding, Phase 0 #19.)
-    #   For a first "not forward-only" run, do (1) only. Add (2) after.
-    # -----------------------------------------------------------------------
-    # To flip to RPP: comment this block, uncomment the RPP block above, restart T4.
+    # POST-HARDWARE-FIX (Session 3): the mis-mounted rear wheels that made turns
+    # strafe are corrected, so in-place rotation AND arcs both work natively. The
+    # Session-2 anti-spin / crawl / reverse TEST hacks have been reverted to sane
+    # defaults below. Optional modes if you want them:
+    #   - allow REVERSE:  vx_min: -0.10 + PreferForwardCritic.enabled: false +
+    #     PathAngleCritic.mode: 1   (CAUTION: rear is lidar-blind — costmap is the
+    #     /scan_filtered front arc only; reverse can't see obstacles behind.)
+    #   - allow STRAFE:   motion_model: "Omni" + vy_max: 0.10 + vy_std: 0.15
+    #     (works now, but mecanum rollers still slip on the smooth floor — keep
+    #     off unless needed.)
+    # To flip to RPP/DWB: comment this block, uncomment a fallback above, restart T4.
     # ========================================================================
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
       time_steps: 30                 # horizon = time_steps * model_dt = 3.0 s
-      model_dt: 0.1                   # MUST be >= controller period (1/controller_frequency
-                                      # = 1/10 = 0.1). MPPI aborts if period > model_dt.
+      model_dt: 0.1                   # MUST be >= controller period (1/10 = 0.1)
       batch_size: 1000               # modest for the 6-core Orin (default 2000)
       vx_std: 0.15
-      vy_std: 0.0                    # TEST B(2): raise to 0.15 for strafe (Omni)
-      wz_std: 0.5                    # ROTATION TEST: wider sampling so optimizer explores fast spins
-      vx_max: 0.10                   # crawl cruise, matches RPP/DWB
-      vx_min: -0.10                  # TEST B(1) ACTIVE: reverse allowed (crawl). 0.0 = forward-only.
-                                      # CAUTION: rear is BLIND — costmap sees only the front arc, so
-                                      # reverse cannot detect obstacles behind. Use -0.05 for slower/safer.
-      vy_max: 0.0                    # TEST B(2): raise to 0.10 for strafe (Omni)
-      wz_max: 1.5                    # ROTATION TEST: raised 0.5 -> 1.5 rad/s (~86 deg/s) to test
-                                      # whether faster in-place rotation overcomes slip on bare floor.
+      vy_std: 0.0                    # strafe sampling off (DiffDrive)
+      wz_std: 0.2                    # standard yaw sampling
+      vx_max: 0.18                   # cautious cruise (home with cats); crawl no
+                                      # longer needed — turning traction is fixed.
+      vx_min: 0.0                    # forward-only (rear is lidar-blind; see header
+                                      # for how to allow reverse).
+      vy_max: 0.0                    # strafe off (DiffDrive; see header to enable).
+      wz_max: 1.0                    # ~57 deg/s; in-place rotation works now.
       iteration_count: 1
       prune_distance: 1.5
       transform_tolerance: 0.2
       temperature: 0.3
       gamma: 0.015
-      motion_model: "DiffDrive"      # TEST B(2): set "Omni" to enable strafe
+      motion_model: "DiffDrive"      # set "Omni" + vy_* to enable strafe
       visualize: false
       AckermannConstraints:
         min_turning_r: 0.0
@@ -195,9 +181,8 @@ controller_server:
         cost_power: 1
         cost_weight: 3.0
         threshold_to_consider: 0.3
-      PreferForwardCritic:          # bias forward motion (traction)
-        enabled: false              # TEST B(1): OFF so reverse is actually usable; at weight 5.0
-                                      # the forward bias otherwise suppresses reverse. true = Test A.
+      PreferForwardCritic:          # bias forward motion
+        enabled: true               # forward-only default; set false to allow reverse (see header)
         cost_power: 1
         cost_weight: 5.0
         threshold_to_consider: 0.5
@@ -222,16 +207,16 @@ controller_server:
         threshold_to_consider: 0.6
       PathAngleCritic:
         enabled: true
-        mode: 1                     # TEST B(1): 1 = NO_DIRECTIONAL_PREFERENCE — don't penalize the
-                                      # 180-deg heading of reverse motion. 0 = forward-only pref = Test A.
+        mode: 0                     # 0 = forward-direction preference. Set 1
+                                      # (NO_DIRECTIONAL_PREFERENCE) if allowing reverse (see header).
         cost_power: 1
         cost_weight: 2.0
         threshold_to_consider: 0.4
-      TwirlingCritic:               # penalize spinning-in-place (scrub killer)
+      TwirlingCritic:               # discourage aimless spin-in-place (dither)
         enabled: true
         cost_power: 1
-        cost_weight: 2.0            # ROTATION TEST: lowered 10 -> 2 so MPPI is WILLING to spin in
-                                      # place (at 10 it always arced instead; restore 10 after test).
+        cost_weight: 10.0           # nav2 default; rotation works now, this just
+                                      # prevents pointless twirling — MPPI still turns as needed.
 
 local_costmap:
   local_costmap:

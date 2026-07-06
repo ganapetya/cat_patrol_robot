@@ -1054,6 +1054,94 @@ carpet region is designated on the map. Mechanical grip (tape/rug) remains the r
    (carried from Session 1).
 4. Build the carpet-vs-bare-floor mode switch (map region → TwirlingCritic/rotate mode).
 
+### Session 3 — 2026-07-06  (ROOT CAUSE FOUND: linear.y ↔ angular.z swapped on the chassis)
+
+**This session overturns the entire "can't turn on the slick floor / traction" thesis
+of Sessions 1–2.** The turning problem was never (mainly) traction — the base has
+`linear.y` and `angular.z` **physically exchanged** below the driver.
+
+**How it was found.** User noticed that with the joystick, the LEFT stick "rotated
+the car well" on the smooth floor while the RIGHT stick "slid it aside" (the Nav2
+failure). Recorded `/joy` + `/cmd_vel` (`scratchpad/joy_cmd_logger.py`): LEFT stick =
+`axes[0]` → **pure `linear.y`** (strafe cmd); RIGHT stick = `axes[2]` → **pure
+`angular.z`** (yaw cmd). So the "good rotation" was a **strafe command**, and the
+"slide" was a **yaw command** — inverted from their meaning.
+
+**Confirmed by controlled Twist tests** (`scratchpad/pub_twist.py`, joystick off so
+`/cmd_vel` has one publisher):
+- pure `linear.y=0.12` → robot **rotated** (full clean circle on the bare floor)
+- pure `angular.z=0.4` → robot **strafed** sideways
+- `vx + linear.y` → smooth arc/spin
+
+**Kinematics proof.** Strafe and rotate mecanum wheel-patterns differ ONLY in the two
+rear wheels; `vx` (all wheels same sign) is immune. A rear-wheel swap gives EXACTLY
+`vx→vx, vy→wz, wz→vy` (no residue) — which is why forward driving always looked fine
+and only turns misbehaved. Root cause is below `Mcnamu_driver_X3.py` line 128
+(`set_car_motion` args are in the CORRECT order) — i.e. MCU/library mixing or a
+physical wheel/lead issue (hypothesis at this point; RESOLUTION below pins it to
+**mis-mounted rear wheels**). Also explains [[project_odom_imu_fusion]] "wheel rotation
+dead ~5°/90°": `get_motion_data()` returns vy/angular swapped too, so true rotation
+was read back as strafe → angular≈0.
+
+**INTERIM software workaround (built + verified, then REVERTED — superseded by the
+hardware fix in RESOLUTION below; kept here for the record only):**
+- `Mcnamu_driver_X3.py`: params `swap_vy_wz` (bool, default False), `swap_wz_scale`
+  (0.12), `swap_vy_scale` (1.0), + live `add_on_set_parameters_callback` (tune via
+  `ros2 param set /driver_node swap_wz_scale X`, no restart). When on:
+  `set_car_motion(vx, w_corrected*swap_wz_scale, vy_corrected*swap_vy_scale)`.
+- `yahboomcar_bringup_X3_launch.py`: matching launch args wired to the driver.
+- Enable: `bash t1 ... swap_vy_wz:=true trim_vy_per_vx:=0.0`. Log shows `swap_vy_wz=True`.
+- Symlink install → no rebuild, just restart t1. Default OFF preserves old behaviour.
+
+**Angular-scale calibration (IMU `/imu/data_raw` gyro, `scratchpad/calib_wz.py`).**
+Feeding a rad/s value into the library's m/s (strafe) slot over-rotates ~**11.5×**.
+Calibrated `swap_wz_scale`:
+| commanded wz | actual (gyro) @ scale 0.12 | gain |
+|---|---|---|
+| 0.2 | 0.096 | 0.48× (deadband, weak) |
+| 0.4 | 0.420 | **1.05× (tuned point)** |
+| 0.8 | 1.038 | 1.30× (hot) |
+Nonlinear (strafe deadband at low end); `0.12` nails mid-range, closed-loop AMCL
+absorbs the ends. `/imu/data_raw` gyro-z sign is inverted vs command (CCW→−gz);
+direction correct by eye, magnitude used for calib.
+
+**What this retires from Sessions 1–2:** the grip-tape/rug plan, RPP `use_rotate_to_
+heading:false`, MPPI `TwirlingCritic` spin tuning, the carpet-vs-bare-floor mode
+switch, and "in-place rotation is a dead end on mecanum" — all were treating symptoms
+of the swap. In-place rotation works fine once `angular.z` actually rotates.
+
+**RESOLUTION (same session) — HARDWARE FIX, root cause was mis-mounted wheels.**
+Rather than ship the software swap, we chased the true cause:
+- **Per-wheel `set_motor` test** (t1 stopped, standalone script): each channel drives
+  its own correct wheel, all spin forward for +cmd (m1=FL, m2=RL, m3=FR, m4=RR). So
+  **wiring + motor directions are PERFECT** — not a crossed lead.
+- **`set_car_motion` does no mixing in Python** — it ships (vx,vy,vz) to the MCU;
+  the mecanum mixing is in firmware. `set_motor` bypasses it.
+- **Hand-built textbook STRAFE pattern** (FL-,FR+,RL+,RR-, a pure-roller pattern)
+  via `set_motor` produced **ROTATION**, not strafe → purely the physical wheels →
+  **two mecanum wheels mounted with the wrong roller orientation** ("sides-match"
+  instead of diagonal-X). Firmware innocent.
+- **FIX: swapped the two REAR wheels (rear-left <-> rear-right).** Re-tested NATIVE
+  (`set_car_motion`, no ROS/software): `(0,0,1.0)`→rotates left, `(0,0.3,0)`→strafes
+  left (+y correct), `(0.2,0,0)`→straight forward. All correct, NOT mirrored.
+- **Reverted ALL the software hacks** (swap_vy_wz/scale params + param-callback in
+  `Mcnamu_driver_X3.py` and launch). `t1.sh` restored to `use_joystick:=true`, no
+  swap arg, dropped `trim_vy_per_vx:=0.012` (hardware-fixed → not needed).
+- **Odom auto-fixed too:** correct wheels → correct encoder→odom, so the old "wheel
+  rotation dead ~5°/90°" is resolved; the planned odom-read software fix is moot.
+
+**TODO Session 4:**
+1. Bring up the CLEAN stack (`t1` normal) and verify end-to-end through ROS:
+   `/cmd_vel` angular.z rotates, linear.y strafes, `/odom` reports rotation now.
+2. `nav2_params.yaml` **cleaned (done this session):** MPPI reverted to sane
+   post-fix defaults — `vx_max 0.10→0.18`, `vx_min -0.10→0.0` (forward-only),
+   `wz_max 1.5→1.0`, `wz_std 0.5→0.2`, `PreferForwardCritic` on, `PathAngleCritic
+   mode 0`, `TwirlingCritic 2→10`, goal `yaw_goal_tolerance 0.5→0.25`, progress
+   checker back to defaults. RPP/DWB remain commented fallbacks. **Still TODO:
+   re-run Nav2 (t4) and verify a goal drives + turns cleanly.**
+3. EKF: may switch heading back to wheel-odom, or keep IMU (both fine now).
+4. Milestone 2 C++ client result paths (still carried from Sessions 1–2).
+
 ### Final results
 
 - nav2_params that worked: inflation=___, max_vel_x=___, robot_radius=___
