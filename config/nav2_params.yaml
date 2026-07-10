@@ -16,9 +16,20 @@ bt_navigator:
     bt_loop_duration: 10
     default_server_timeout: 20
     # bt_navigator needs an ABSOLUTE path to the BT XML (a bare filename fails
-    # to open). Point at the ones shipped with nav2_bt_navigator.
-    default_nav_to_pose_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
-    default_nav_through_poses_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml"
+    # to open).
+    # default_nav_to_pose_bt_xml: custom tree (this package's config/), NOT the
+    # nav2_bt_navigator stock one. Root cause 2026-07-10: /scan_filtered is
+    # front-arc-only (~220 deg, see scan_front_filter), so the local costmap
+    # has no idea what's behind the robot. The stock BT's BackUp recovery
+    # action blindly reversed into an unseen object and nearly hit the rear
+    # antennas. This tree replaces BackUp with Spin (safe: rotates using the
+    # observed front arc, never blindly translates into unmapped space).
+    default_nav_to_pose_bt_xml: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/config/navigate_to_pose_no_blind_backup.xml"
+    # bt_navigator loads AND VALIDATES both trees at activation time (even though
+    # patrol_manager never sends a NavigateThroughPoses goal) — the stock file here
+    # also references "backup", which no longer has an action server. Must point at
+    # the no-blind-backup variant too, or bt_navigator fails to activate entirely.
+    default_nav_through_poses_bt_xml: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_patrol_robot/config/navigate_through_poses_no_blind_backup.xml"
     # plugin_lib_names left at the Nav2 defaults (the full stock list works);
     # see dwa_nav_params.yaml if you need to pin the exact set.
 
@@ -35,12 +46,27 @@ controller_server:
     controller_plugins: ["FollowPath"]
 
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      # PoseProgressChecker (not SimpleProgressChecker): credits in-place rotation
+      # as progress, not just XY displacement. Root-caused 2026-07-10 — large
+      # final-yaw waypoints (wp5/wp6, ~166-174°) made the robot legitimately
+      # grind through a slow final turn near a wall; SimpleProgressChecker is
+      # blind to rotation and kept firing "Failed to make progress" every
+      # ~10s, aborting + BT-retrying the goal from scratch over and over
+      # (26 abort/retry cycles across the two waypoints in one cycle).
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.5    # nav2 default (crawl-era 0.10 no longer needed)
-      movement_time_allowance: 10.0    # nav2 default (crawl-era 25.0 no longer needed)
+      required_movement_angle: 0.5     # ~29 deg rotation within the window also counts as progress
+      movement_time_allowance: 20.0    # extra headroom (was 10.0) for slow rotation in tight corners
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.15          # tight final POSITION
+      # Loosened 0.15->0.20 (2026-07-10): SmacPlannerHybrid's grid quantization
+      # (esp. with downsample_costmap) can land the terminal path node correct
+      # in heading but a few cm to several cm LATERALLY off the true goal. A
+      # forward+rotate-only robot (no strafe, no reverse) closing a purely
+      # lateral gap needs an awkward curve-in/rotate/creep/rotate-back dance —
+      # slow and replan-heavy. A bit more tolerance avoids demanding that dance
+      # for a small quantization artifact.
+      xy_goal_tolerance: 0.20
       yaw_goal_tolerance: 0.25         # proper final heading — rotation works now
                                        # (was 0.5 to dodge slick-floor spin; no longer needed)
       stateful: True
@@ -293,11 +319,45 @@ planner_server:
     use_sim_time: false
     expected_planner_frequency: 20.0
     planner_plugins: ["GridBased"]
+    # SmacPlannerHybrid (not NavfnPlanner) — root-caused 2026-07-10: NavfnPlanner is a
+    # pure (x,y) Dijkstra/A* search with NO concept of heading, so it always draws the
+    # shortest straight-ish line to a waypoint's position and leaves the ENTIRE final
+    # orientation (e.g. wp5's 166°) to be resolved by in-place rotation after arrival —
+    # which is what caused the wp5/wp6 stalls. MPPI's own receding horizon (~1.5-3m) is
+    # also too short to discover a wide loop-around on its own. SmacPlannerHybrid
+    # searches in (x, y, heading) space, so it can plan a path that swings past a
+    # waypoint and approaches from the other side already facing the right way —
+    # exactly the maneuver observed by eye ("reachable if the bot goes further than
+    # wp5 and turns back"). motion_model_for_search=DUBIN (forward-only curves, no
+    # reverse) matches our rear-blind-lidar constraint.
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
       tolerance: 0.5
-      use_astar: false
       allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      motion_model_for_search: "DUBIN"   # forward-only curves — no reverse (rear is lidar-blind)
+      angle_quantization_bins: 72        # 5 deg heading resolution
+      minimum_turning_radius: 0.10       # small: robot can rotate in place, this just
+                                         # bounds how tight Hybrid-A*'s analytic curves are
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0
+      cache_obstacle_heuristic: false
+      debug_visualizations: false
+      # REVERTED 2026-07-10 (was downsample_costmap:true/factor:2): halving the
+      # planning grid to 10cm cells is the likely cause of "lands next to the
+      # waypoint arrow, correct heading, but laterally offset" — Hybrid-A*'s
+      # analytic expansion isn't cleanly reaching the exact continuous goal
+      # near tight spots, so it snaps to the coarser quantized grid node
+      # instead. Trading CPU for positional precision; revisit if planner
+      # loop rate becomes a bigger problem than this.
+      downsample_costmap: false
+      downsampling_factor: 1
 
 behavior_server:
   ros__parameters:
@@ -305,11 +365,12 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    behavior_plugins: ["spin", "backup", "wait"]
+    # "backup" intentionally NOT registered here (2026-07-10): with a front-arc-only
+    # costmap, BackUp would blindly reverse into whatever's behind the robot. No
+    # action server for it exists now, so it can't be invoked by any BT or by hand.
+    behavior_plugins: ["spin", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"
-    backup:
-      plugin: "nav2_behaviors/BackUp"
     wait:
       plugin: "nav2_behaviors/Wait"
     global_frame: odom

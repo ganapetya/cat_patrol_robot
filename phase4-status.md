@@ -8,10 +8,14 @@ Phase 4 = build a **Nav2-native patrol manager** that wakes on schedule,
 drives through recorded waypoints, captures photos at each waypoint, returns
 home, sends one email bundle, and goes back to sleep.
 
-> **STATUS: In progress — first run attempted 2026-07-09, BLOCKED at wp5.**
-> Package built and running; 10 waypoints + home captured on the new map;
-> first cycle aborted when the Nav2 goal for wp5 failed. See §11 Session 1 for
-> the full state and the resume plan. Use §11 as your running session log.
+> **STATUS: PAUSED for battery recharge (2026-07-10 end of Session 2).**
+> A full cycle has succeeded once (home + per-waypoint mail). wp5/wp6 are
+> still unreliable — four fixes have been applied in sequence, each addressing
+> a real bug found along the way, but the last one (goal-tolerance +
+> full-resolution planning) has **not been tested live yet**. Stall guard is
+> validated working (correctly fired on an 11.1V battery drop). See
+> **§11.5 RESUME CHECKLIST** for exactly what to do next, and §11 Session 2
+> for the full diagnostic trail with log evidence.
 
 ---
 
@@ -1062,7 +1066,340 @@ per-waypoint navigation, and state transitions are all functioning. The blocker
 is a single unreachable/hard waypoint plus the abandon-on-failure policy, not a
 structural problem.
 
-### Session 2 — ___
+### Session 2 — 2026-07-10
+
+**Static-map analysis of the wp5 abort (no robot movement, done offline).**
+- Parsed `living_room_v1.pgm`/`.yaml` directly. wp5 (6.478, -1.132) sits in
+  mapped **free** space; the nearest mapped wall is ~1.3 m east (not literally
+  against a wall as first suspected). The robot's final resting spot
+  (6.766, -1.405) is also mapped-free, ~0.4 m SE of wp5 — consistent with it
+  getting stuck/drifting mid-rotation or mid-recovery, not colliding with a
+  mapped wall.
+- wp5's commanded yaw (2.904 rad ≈ 166°) is a near-total reversal right as the
+  robot arrives in that corner — prime suspect for triggering MPPI/recovery
+  churn, possibly compounded by a live obstacle (`/scan_filtered`) not present
+  in the static map. **Static map alone can't confirm this** — needs a live
+  RViz costmap watch during the approach (see original resume plan step 2,
+  still open).
+
+**Code hardening applied (§14d item, "biggest robustness gap"):** in
+`patrol_manager_node.cpp`, a waypoint goal failure no longer abandons the
+whole cycle to `SLEEPING`. The result callback now logs the failed waypoint
+name/code and calls `send_next_waypoint_goal()` directly, which either sends
+the next waypoint or — if none remain — transitions to `RETURNING` and sends
+the home goal. So one bad waypoint is now skipped (no photo for it) instead
+of losing home-return + the mail request for the whole cycle. Home-goal
+failure behavior is unchanged (still → `SLEEPING`, no mail, since the robot
+never actually arrived home). Rebuilt clean:
+`colcon build --symlink-install --packages-select patrol_manager` — 23.5s, no errors.
+
+**Not yet done (needs a live session with operator present):**
+- Recapture wp5 pulled back ~30–40 cm from the corner and/or reorder its yaw
+  so it isn't a ~166° in-place turn in the tightest part of the corner.
+- Before trusting a new wp5 pose in patrol_manager, send a one-off
+  `NavigateToPose` goal there via RViz "Nav2 Goal" to confirm Nav2 can reach
+  it standalone.
+- Re-run a full cycle with `loop_patrol=false` to confirm: wp5 no longer
+  aborts, AND (as a fallback) the skip-and-continue fix now gets the robot
+  home + one mail even if some other waypoint fails.
+
+**Same-day live run (after a full stack restart):** full cycle completed —
+robot returned home, images sent. wp5 was "really difficult" to reach (didn't
+abort outright this time, but struggled — consistent with the corner/166°-turn
+suspicion above, still not conclusively root-caused). **wp6 was skipped** —
+this is the skip-and-continue hardening from earlier today working as
+designed (wp6 likely hit a similar Nav2 abort; check the patrol_manager
+terminal for the "Waypoint 'wp6' goal failed (code=...)" line next session to
+see why). Also investigated a separate live "robot does not move, nav reports
+failed points" incident during this session: the local-costmap
+"Message Filter dropping" burst turned out to be a one-time startup transient
+(stopped after ~15s, absent from the 7/09 log), and the real symptom reported
+("very weak twitch then nothing" at wp1) pointed at hardware/power rather than
+Nav2 config — not fully diagnosed before the stack was restarted and started
+working. **Worth keeping an eye on battery voltage under load** if this
+recurs.
+
+**Feature change applied (user request):** photos are no longer bundled into
+one email at cycle end. `patrol_manager_node.cpp` now calls a new
+`send_waypoint_mail(name, path)` immediately after each successful capture in
+`CAPTURE` state (one email per waypoint, subject suffixed with the waypoint
+name, single attachment). The old `send_mail_request()` (batched, sent only
+after arriving home) was removed per explicit user preference — **no email is
+sent on home arrival**, just a log line with the photo count. `current_waypoint_`
+member added so the CAPTURE state knows which waypoint's name to label the
+mail with. Rebuilt clean.
+
+**wp5/wp6 ROOT CAUSE FOUND (from this run's controller_server + patrol_manager
+logs, not guesswork):** wp5 took 165.6s and wp6 took 177.3s to resolve (vs.
+~9–16s for wp1–4). `distance remaining` feedback shows the mechanism precisely:
+- Early on, it oscillates hard (1.53→1.09→0.46→1.41→0.51→1.76→0.79 m...) — the
+  global planner is recomputing a materially different path almost every
+  replan cycle, not converging on one route.
+- Then it goes dead flat — stuck at exactly `0.30 m` for ~30s, later flat at
+  `0.16–0.18 m` for another ~30s. Zero net XY translation during these
+  stretches.
+- Every ~10s during this, `controller_server` logs `ERROR: Failed to make
+  progress` → `[follow_path] Aborting handle` → clears the local costmap →
+  BT immediately restarts the goal from scratch. **26 of these abort/retry
+  cycles fired across the wp5+wp6 window in this one run.**
+
+**Mechanism:** wp5 (yaw 2.904 ≈166°) and wp6 (yaw 3.036 ≈174°) both demand a
+huge final-heading change vs. wp1–4 (≤16°). The robot gets close in XY
+(~0.3 m) then has to grind through a large in-place rotation to match the
+final orientation — likely moving cautiously because `ObstaclesCritic` is wary
+of the nearby wall during the turn. `nav2_controller::SimpleProgressChecker`
+(the plugin in use) **only measures XY displacement** — it is blind to
+rotation. So while the robot is legitimately working on the turn, the checker
+sees "no XY movement in 10s," aborts, and the BT restarts the goal from
+scratch — over and over. wp5 eventually won this race by chance; wp6 didn't
+and hit `ABORTED` (code=6) for good. This also explains the earlier
+"weak twitch then nothing" report — that was this exact stall caught mid-cycle,
+not a hardware/power issue as first suspected.
+
+**Fix applied (`cat_patrol_robot/config/nav2_params.yaml`):** switched
+`progress_checker_plugin` from `nav2_controller::SimpleProgressChecker` to
+`nav2_controller::PoseProgressChecker` (also a stock Nav2 plugin, in the same
+`nav2_controller` package — confirmed via `dpkg -L ros-humble-nav2-controller`
+and the installed header, not custom code). It extends SimpleProgressChecker
+with `required_movement_angle` (set to 0.5 rad ≈29°) — rotating that much
+within the time window now also counts as progress, not just XY movement.
+Also raised `movement_time_allowance` 10.0 → 20.0s for extra headroom. YAML
+config only, **no rebuild — requires a T4 restart** to take effect. **Not yet
+tested live** — next session: restart T4, re-run wp5/wp6, confirm no more
+abort/retry thrashing.
+
+**SAFETY INCIDENT: blind backup into an unseen object.** During one of the
+abort/retry cycles above (or a similar stall), the robot drove backward into
+something behind it, got physically stuck, and risked damaging the rear
+antennas — with no awareness anything was wrong. Root cause: Nav2's stock
+recovery behavior tree (`navigate_to_pose_w_replanning_and_recovery.xml`)
+alternates `ClearingActions` and `BackUp backup_dist="0.50" backup_speed="0.10"`
+in its `RecoveryFallback` `RoundRobin`. `BackUp` drives the robot backward
+using the local costmap for "safety" — but `/scan_filtered` is deliberately
+restricted to the front ~220° arc (the fix for the lidar-mount/antenna
+map-collapse issue, see [[project_slam_map_collapse]]/earlier sessions), so
+the local costmap has **zero knowledge of anything behind the robot**. `BackUp`
+can confidently reverse into something it is structurally blind to.
+
+**Fix applied (two-pronged, config only, no rebuild):**
+1. New custom BT XML `cat_patrol_robot/config/navigate_to_pose_no_blind_backup.xml`
+   — identical to the stock tree except `BackUp` is replaced with
+   `Spin spin_dist="1.57"` in the `RoundRobin` recovery fallback. Spin only
+   rotates in place using the safely-observed front arc; it can't blindly
+   translate into unmapped space. `bt_navigator.default_nav_to_pose_bt_xml` in
+   `nav2_params.yaml` now points at this file (absolute path required).
+2. Removed `"backup"` from `behavior_server.behavior_plugins` entirely
+   (`["spin", "backup", "wait"]` → `["spin", "wait"]`) — defense in depth, so
+   no `/backup` action server exists at all and it can't be invoked by any BT
+   or by hand, not just the patrol one.
+
+**Correction found on first T4 restart attempt:** bt_navigator failed to
+activate — `"backup" action server not available after waiting for 1.00s"` /
+`Error loading XML file: navigate_through_poses_w_replanning_and_recovery.xml`.
+Cause: bt_navigator loads AND VALIDATES **both** `default_nav_to_pose_bt_xml`
+and `default_nav_through_poses_bt_xml` at activation, even though
+patrol_manager only ever sends `NavigateToPose` goals, never
+`NavigateThroughPoses`. The stock through-poses tree still referenced
+`BackUp`, which no longer has an action server, so the whole bt_navigator node
+failed to activate — breaking the entire nav stack, not just recovery.
+**Fixed:** added a matching
+`cat_patrol_robot/config/navigate_through_poses_no_blind_backup.xml` (same
+`BackUp`→`Spin` substitution) and pointed
+`default_nav_through_poses_bt_xml` at it too. Both XMLs validated
+(`xml.etree.ElementTree`) and `nav2_params.yaml` re-validated as YAML.
+**Requires a T4 restart. Not yet tested live.**
+
+**NEW CAPABILITY: cmd_vel-vs-vel_raw stall guard, `patrol_manager_node.cpp`.**
+This robot has no motor-current/torque sensing and no bump/rear sensor, but
+`Mcnamu_driver_X3.py` already publishes `/vel_raw` (actual measured velocity
+from wheel encoders) alongside the commanded `/cmd_vel` — enough to detect a
+physical stall without new hardware. Added `check_stall()`, called every FSM
+tick (100ms) during `PATROLLING`/`RETURNING`: if commanded speed exceeds
+`stall_cmd_vel_threshold` (0.03, param) while measured `/vel_raw` speed stays
+below `stall_vel_raw_threshold` (0.02, param) continuously for
+`stall_timeout_sec` (6.0, param), it's a stall. On detection: cancels the
+active `NavigateToPose` goal (`active_goal_handle_`, captured via
+`goal_response_callback` in both `send_next_waypoint_goal` and
+`send_home_goal`), transitions to `SLEEPING`, and emails a
+"STALL near <waypoint>" alert (no attachment) via the same
+`/cat_patrol/mail_request` pipe. Both result callbacks now guard on
+`state_ == State::SLEEPING` at entry so the async cancel's eventual result
+(CANCELED) doesn't resurrect the cycle after the stall guard already stopped
+it. New params in `patrol_manager_params.yaml`:
+`cmd_vel_topic`/`vel_raw_topic`/`stall_timeout_sec`/`stall_cmd_vel_threshold`/
+`stall_vel_raw_threshold`. Rebuilt clean. **Not yet tested live against a real
+stall** — next session, worth deliberately checking it doesn't false-trigger
+during a legitimate slow final rotation (6s should be short enough for MPPI
+creep but comfortably clear of a stall; watch for false positives).
+
+**wp5 STILL not reaching reliably even after the PoseProgressChecker +
+no-blind-backup fixes — user identified the deeper architectural cause by
+eye:** wp5 is trivially reachable if the robot overshoots past it and
+approaches from the far side instead of arriving directly from wp4. Root
+cause: `planner_server`'s `GridBased` plugin was `nav2_navfn_planner/NavfnPlanner`
+— a pure (x,y) Dijkstra/A* search with **no concept of heading at all**. It
+always draws the shortest-ish straight path to a waypoint's *position*, and
+the ENTIRE final-orientation problem (wp5's 166°) is left to be resolved by
+in-place rotation after arrival — which is exactly what was stalling. MPPI's
+own receding horizon (`prune_distance: 1.5`, ~3s) is also far too short to
+discover a multi-meter loop-around on its own; this was never something either
+stage of the pipeline could find, not a tuning gap.
+
+**Fix applied (`cat_patrol_robot/config/nav2_params.yaml`, `planner_server`):**
+switched `GridBased` from `nav2_navfn_planner/NavfnPlanner` to
+`nav2_smac_planner/SmacPlannerHybrid` (already installed:
+`ros-humble-nav2-smac-planner`) — a Hybrid-A* planner that searches in
+**(x, y, heading)** space, so it can natively plan a path that swings past a
+waypoint and approaches from the other side already facing the target
+heading. Key params: `motion_model_for_search: "DUBIN"` (forward-only curves —
+matches the rear-blind-lidar no-reverse constraint), `minimum_turning_radius:
+0.10` (robot can rotate in place; this just bounds how tight the analytic
+curves are), `angle_quantization_bins: 72` (5° resolution),
+`downsample_costmap: true` / `downsampling_factor: 2` (Orin NX is
+CPU-constrained — `astra_camera_node` alone runs ~75-85% of a core — this
+keeps Hybrid-A* planning latency down). YAML validated. **Config only, no
+rebuild, requires a T4 restart. Not yet tested live** — next session: confirm
+(a) it actually finds loop-around approaches for wp5/wp6, (b) planning time
+stays well under the 1Hz replan budget on this hardware, (c) path quality is
+acceptable for MPPI to follow (a `smoother_server` may be worth adding later
+if Hybrid-A* paths look jagged — not added yet, keeping this change scoped).
+
+**Live test of SmacPlannerHybrid — confirmed loaded (`ros2 param get` showed
+`nav2_smac_planner/SmacPlannerHybrid`, custom BT XMLs, `PoseProgressChecker`,
+`behavior_plugins=['spin','wait']` — all prior fixes DID load), but "no
+improvement" reported. `planner_server` log showed the actual mechanism:**
+```
+GridBased: failed to create plan, no valid path found.
+Planning algorithm GridBased failed to generate a valid path to (6.48, -1.13)
+[compute_path_to_pose] [ActionServer] Aborting handle.
+```
+Hybrid-A* is now hard-FAILING to find any forward-only (DUBIN) path to wp5 at
+all — worse in one sense than NavFn (which always found *some* path). Also:
+`Planner loop missed its desired rate of 20.0000 Hz. Current loop rate is
+1.17 Hz` (was near-instant with NavFn) — Hybrid-A* is much heavier than NavFn
+on this CPU-constrained Orin NX.
+
+**STALL GUARD VALIDATED LIVE (unplanned but confirmed working):** battery
+voltage dropped to 11.1V mid-session; the stall guard correctly fired and sent
+a stall alert. First real-world confirmation the cmd_vel-vs-vel_raw mechanism
+works as designed. Robot needs a recharge before further testing.
+
+**NEW CAPABILITY: waypoint visualization markers, `patrol_manager_node.cpp`.**
+Added `publish_waypoint_markers()` — publishes a latched (`transient_local`)
+`visualization_msgs/MarkerArray` to `/patrol_manager/waypoints` once at
+startup: one ARROW + one TEXT_VIEW_FACING label per waypoint (blue) plus home
+(red), built directly from the same `Pose2D` data the FSM navigates to (not a
+separate copy that could drift out of sync). Add a MarkerArray display in
+RViz on that topic to see waypoints against the costmap/inflation. New
+`visualization_msgs` dependency added to `package.xml`/`CMakeLists.txt`.
+Rebuilt clean.
+
+**NEW SYMPTOM IDENTIFIED BY EYE (user observation, not from logs): the robot
+frequently "lands next to the arrow, not on it"** — same commanded heading as
+the waypoint, but positionally offset to the side by some distance — and
+closing that gap causes exactly the slow "turmoil" (turning/replanning) seen
+in the earlier stalls. **Diagnosis:** `SmacPlannerHybrid` searches on a
+discretized (x,y,heading) grid; `downsample_costmap: true` /
+`downsampling_factor: 2` (added last session for CPU headroom) doubled the
+planning cell size to 10cm. Hybrid-A* is supposed to finish with an exact
+"analytic expansion" — a precise Dubin curve straight into the real continuous
+goal pose — but when that final connection doesn't cleanly succeed (e.g. near
+a tight spot), it falls back to the last quantized grid node instead: correct
+heading, but snapped to a coarse cell — i.e. beside the arrow. Because this
+robot cannot strafe or reverse (forward+rotate only), closing a purely
+*lateral* residual requires an awkward curve-in/rotate/creep/rotate-back
+dance — slow and replan-heavy, matching the observed "turmoil." **This may
+well be the same mechanism behind the original wp5/wp6 stalls, now seen more
+clearly** — likely more "small lateral offset, hard to correct without
+strafing" than "large final rotation" per se.
+
+**Fix applied (`cat_patrol_robot/config/nav2_params.yaml`):**
+1. Reverted `downsample_costmap` to `false` / `downsampling_factor: 1` —
+   trading the CPU savings back for full 5cm planning resolution, to reduce
+   the quantization snapping directly.
+2. Loosened `general_goal_checker.xy_goal_tolerance` 0.15 → 0.20 as a buffer
+   against whatever quantization/analytic-expansion slop remains.
+YAML validated. **Config only, no rebuild, requires a T4 restart AND a
+battery recharge first. Not yet tested live.**
+
+---
+
+## 11.5 RESUME CHECKLIST (start here after recharge)
+
+### What's true right now (2026-07-10, end of session)
+
+- **Battery low (11.1V seen), robot paused to recharge.** Charge before doing
+  anything else — the stall guard will just keep firing otherwise.
+- **`patrol_manager` binary is rebuilt and current** with: skip-and-continue on
+  waypoint failure, per-waypoint email (no more end-of-cycle batch), the
+  cmd_vel-vs-vel_raw stall guard (**validated working live**), and the new
+  `/patrol_manager/waypoints` RViz marker publisher. No pending code changes.
+- **`nav2_params.yaml` + 2 new BT XML files have pending config changes that
+  need a T4 restart to load** (T4 was last restarted BEFORE the final
+  goal-tolerance/downsample fix below — that specific combination has not run
+  live yet):
+  - `progress_checker_plugin`: `PoseProgressChecker` (was `SimpleProgressChecker`)
+  - `default_nav_to_pose_bt_xml` / `default_nav_through_poses_bt_xml`: custom
+    files in `cat_patrol_robot/config/` with `BackUp` removed, `Spin` in its place
+  - `behavior_server.behavior_plugins`: `["spin", "wait"]` (`"backup"` removed
+    entirely — no `/backup` action server exists anymore)
+  - `planner_server.GridBased`: `nav2_smac_planner/SmacPlannerHybrid` (was
+    `NavfnPlanner`), `motion_model_for_search: DUBIN`, `minimum_turning_radius: 0.10`,
+    **`downsample_costmap: false`** (reverted from `true` this session)
+  - `general_goal_checker.xy_goal_tolerance`: `0.20` (was `0.15`)
+- All of the above YAML/XML has been syntax-validated but **not exercised live
+  as one combined config.**
+
+### Do this, in order
+
+1. Confirm battery is charged to a safe level.
+2. Bring up t1→t4 (t4 will load the new `nav2_params.yaml` — this is the
+   restart that's been pending). Confirm no bt_navigator activation errors
+   (watch for the `"backup" action server not available` failure mode from
+   earlier — should not recur, but verify).
+3. Verify live params actually loaded (sanity check, takes 10 seconds):
+   ```bash
+   ros2 param get /planner_server GridBased.plugin       # expect SmacPlannerHybrid
+   ros2 param get /planner_server GridBased.downsample_costmap  # expect false
+   ros2 param get /controller_server general_goal_checker.xy_goal_tolerance  # expect 0.20
+   ros2 param get /behavior_server behavior_plugins      # expect ['spin', 'wait']
+   ```
+4. In RViz, add a **MarkerArray** display on `/patrol_manager/waypoints` (latched,
+   shows immediately) so you can see each waypoint's exact position + commanded
+   heading against the costmap.
+5. Launch t5 (`patrol_manager`) with `loop_patrol=false` and watch a full cycle,
+   paying particular attention to wp5 and wp6:
+   - Does the planner find a path at all now? (Last attempt hard-failed:
+     `"GridBased: failed to create plan, no valid path found"` — check
+     `planner_server` log / RViz global path if it stalls again.)
+   - Does the robot land ON the waypoint arrow now, or still beside it?
+   - Does it still take 100+ seconds, or is it back to the ~10-16s normal range?
+6. If wp5/wp6 are fixed: re-enable `loop_patrol: true` and let it run
+   unattended for real; confirm the scheduled-repeat behavior (never actually
+   tested yet — Session 3 placeholder below is for this).
+7. If STILL stuck: the next lever, in order of suspicion, is (a) planner loop
+   rate under real load — check `planner_server` log for "missed desired rate"
+   warnings again now that downsampling is off, Hybrid-A* may simply be too
+   slow on this Orin NX and need a lighter config or a `smoother_server`
+   addition; (b) `minimum_turning_radius: 0.10` may still be too large/small
+   for this corner — try adjusting; (c) reconsider whether wp5/wp6's poses
+   themselves should just be recaptured slightly differently (the
+   never-executed original idea from Session 1).
+
+### Known-good reference values (don't lose these if you start tuning)
+
+- `xy_goal_tolerance: 0.20`, `yaw_goal_tolerance: 0.25`
+- `PoseProgressChecker`: `required_movement_radius: 0.5`,
+  `required_movement_angle: 0.5`, `movement_time_allowance: 20.0`
+- Stall guard: `stall_timeout_sec: 6.0`, `stall_cmd_vel_threshold: 0.03`,
+  `stall_vel_raw_threshold: 0.02`
+- SmacPlannerHybrid: `motion_model_for_search: DUBIN`,
+  `minimum_turning_radius: 0.10`, `angle_quantization_bins: 72`,
+  `downsample_costmap: false`
+
+---
+
+### Session 3 — ___
 
 - Scheduler repeat cycle: PASS / blockers ___
 - Callback-group/executor behavior under load: ___
