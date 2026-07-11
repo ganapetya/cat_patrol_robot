@@ -1324,86 +1324,207 @@ battery recharge first. Not yet tested live.**
 
 ---
 
-## 11.5 RESUME CHECKLIST (start here after recharge)
+## 11.5 RESUME CHECKLIST (start here next session)
 
-### What's true right now (2026-07-10, end of session)
+### What's true right now (2026-07-11, end of session)
 
-- **Battery low (11.1V seen), robot paused to recharge.** Charge before doing
-  anything else — the stall guard will just keep firing otherwise.
-- **`patrol_manager` binary is rebuilt and current** with: skip-and-continue on
-  waypoint failure, per-waypoint email (no more end-of-cycle batch), the
-  cmd_vel-vs-vel_raw stall guard (**validated working live**), and the new
-  `/patrol_manager/waypoints` RViz marker publisher. No pending code changes.
-- **`nav2_params.yaml` + 2 new BT XML files have pending config changes that
-  need a T4 restart to load** (T4 was last restarted BEFORE the final
-  goal-tolerance/downsample fix below — that specific combination has not run
-  live yet):
-  - `progress_checker_plugin`: `PoseProgressChecker` (was `SimpleProgressChecker`)
-  - `default_nav_to_pose_bt_xml` / `default_nav_through_poses_bt_xml`: custom
-    files in `cat_patrol_robot/config/` with `BackUp` removed, `Spin` in its place
-  - `behavior_server.behavior_plugins`: `["spin", "wait"]` (`"backup"` removed
-    entirely — no `/backup` action server exists anymore)
-  - `planner_server.GridBased`: `nav2_smac_planner/SmacPlannerHybrid` (was
-    `NavfnPlanner`), `motion_model_for_search: DUBIN`, `minimum_turning_radius: 0.10`,
-    **`downsample_costmap: false`** (reverted from `true` this session)
-  - `general_goal_checker.xy_goal_tolerance`: `0.20` (was `0.15`)
-- All of the above YAML/XML has been syntax-validated but **not exercised live
-  as one combined config.**
+- **CONFIRMED WORKING LIVE, end to end:** strafe (Omni MPPI), the odom
+  vy-feedback fix, and the NavfnPlanner revert were all tested together this
+  session and the robot successfully completed waypoint navigation, including
+  the previously-trivial-but-broken "short straight hop" case. This is the
+  first time Phase 4's wp5/wp6-era reliability problem has actually been
+  resolved rather than just reasoned about.
+- **One open minor artifact:** at one waypoint the robot did a full
+  unnecessary 360° spin before still reaching the goal successfully. Low
+  severity (self-corrected, did not block the cycle) — not yet investigated.
+  See §11 Session 3 for candidate causes (TwirlingCritic vs. residual
+  short-path orientation noise vs. a one-off AMCL correction jump).
+- **`patrol_manager` binary current** with: skip-and-continue on waypoint
+  failure, per-waypoint email, the cmd_vel-vs-vel_raw stall guard (validated
+  live), `/patrol_manager/waypoints` RViz markers. No pending code changes.
+- **`yahboomcar_base_node` binary current and live-tested** — odom vy-zeroing
+  fix confirmed working (this is what let strafe actually help).
+- **`nav2_params.yaml` current and live-tested**: `PoseProgressChecker`,
+  no-blind-backup BT XMLs, `behavior_plugins: [spin, wait]`,
+  `xy_goal_tolerance: 0.20`, Omni MPPI strafe (`vy_max: 0.10`),
+  `min_y_velocity_threshold: 0.01`, and now **`planner_server.GridBased:
+  nav2_navfn_planner/NavfnPlanner`** (reverted from SmacPlannerHybrid, which
+  is kept commented in the YAML as a fallback).
 
 ### Do this, in order
 
-1. Confirm battery is charged to a safe level.
-2. Bring up t1→t4 (t4 will load the new `nav2_params.yaml` — this is the
-   restart that's been pending). Confirm no bt_navigator activation errors
-   (watch for the `"backup" action server not available` failure mode from
-   earlier — should not recur, but verify).
-3. Verify live params actually loaded (sanity check, takes 10 seconds):
-   ```bash
-   ros2 param get /planner_server GridBased.plugin       # expect SmacPlannerHybrid
-   ros2 param get /planner_server GridBased.downsample_costmap  # expect false
-   ros2 param get /controller_server general_goal_checker.xy_goal_tolerance  # expect 0.20
-   ros2 param get /behavior_server behavior_plugins      # expect ['spin', 'wait']
-   ```
-4. In RViz, add a **MarkerArray** display on `/patrol_manager/waypoints` (latched,
-   shows immediately) so you can see each waypoint's exact position + commanded
-   heading against the costmap.
-5. Launch t5 (`patrol_manager`) with `loop_patrol=false` and watch a full cycle,
-   paying particular attention to wp5 and wp6:
-   - Does the planner find a path at all now? (Last attempt hard-failed:
-     `"GridBased: failed to create plan, no valid path found"` — check
-     `planner_server` log / RViz global path if it stalls again.)
-   - Does the robot land ON the waypoint arrow now, or still beside it?
-   - Does it still take 100+ seconds, or is it back to the ~10-16s normal range?
-6. If wp5/wp6 are fixed: re-enable `loop_patrol: true` and let it run
-   unattended for real; confirm the scheduled-repeat behavior (never actually
-   tested yet — Session 3 placeholder below is for this).
-7. If STILL stuck: the next lever, in order of suspicion, is (a) planner loop
-   rate under real load — check `planner_server` log for "missed desired rate"
-   warnings again now that downsampling is off, Hybrid-A* may simply be too
-   slow on this Orin NX and need a lighter config or a `smoother_server`
-   addition; (b) `minimum_turning_radius: 0.10` may still be too large/small
-   for this corner — try adjusting; (c) reconsider whether wp5/wp6's poses
-   themselves should just be recaptured slightly differently (the
-   never-executed original idea from Session 1).
+1. Bring up t1→t5 as usual. Re-confirm wp5/wp6 specifically (the original
+   large-final-heading cases, 166-174°) still complete reliably via Omni's
+   blended strafe+rotate — this is the one regression risk NavfnPlanner
+   reintroduces if a future run exposes it (only one live test so far).
+2. Decide whether the single 360°-spin artifact is worth chasing:
+   - If it recurs or gets worse, watch `/amcl_pose` at the exact moment it
+     starts (rules localization drift in/out) and check the RViz global Path
+     shape for that waypoint (rules out a NavfnPlanner orientation-fill
+     artifact on a short path segment in/out).
+   - If it stays rare and harmless (self-corrects, cycle still succeeds),
+     it's reasonable to leave it and move on — Phase 4's core reliability
+     goal is met.
+3. **Next natural milestone:** re-enable `loop_patrol: true` and run a real
+   unattended cycle — this has never actually been tested yet (always run
+   with `loop_patrol=false` so far). Confirms the scheduled-repeat behavior
+   from the acceptance criteria in §2.
 
-### Known-good reference values (don't lose these if you start tuning)
+### Known-good reference values (confirmed working live 2026-07-11)
 
 - `xy_goal_tolerance: 0.20`, `yaw_goal_tolerance: 0.25`
 - `PoseProgressChecker`: `required_movement_radius: 0.5`,
   `required_movement_angle: 0.5`, `movement_time_allowance: 20.0`
 - Stall guard: `stall_timeout_sec: 6.0`, `stall_cmd_vel_threshold: 0.03`,
   `stall_vel_raw_threshold: 0.02`
-- SmacPlannerHybrid: `motion_model_for_search: DUBIN`,
-  `minimum_turning_radius: 0.10`, `angle_quantization_bins: 72`,
-  `downsample_costmap: false`
+- Planner: `nav2_navfn_planner/NavfnPlanner` (SmacPlannerHybrid config
+  preserved commented-out in `nav2_params.yaml` if ever needed again)
+- Strafe (MPPI): `motion_model: Omni`, `vy_max: 0.10`, `vy_std: 0.15`,
+  `min_y_velocity_threshold: 0.01`
 
 ---
 
-### Session 3 — ___
+### Session 3 — 2026-07-11
 
-- Scheduler repeat cycle: PASS / blockers ___
-- Callback-group/executor behavior under load: ___
-- Notes: ___
+**User observation driving this session:** even after the SmacPlannerHybrid +
+goal-tolerance fixes queued at end of Session 2, waypoint arrival is still
+sometimes slow — robot ends up "next to the waypoint, facing the right way"
+and grinds through a slow forward-only curve-in/rotate/creep correction to
+close a small lateral gap. User pointed out the robot is holonomic (mecanum,
+can strafe) and this capability was never actually used by Nav2 — confirmed
+correct: `nav2_params.yaml`'s MPPI `FollowPath` had `motion_model: "DiffDrive"`,
+`vy_max: 0.0`, `vy_std: 0.0` the whole time (comment already noted "works now,
+but... keep off unless needed" from the Session 3 hardware-fix note, but was
+never flipped on).
+
+**Fix applied #1 (`cat_patrol_robot/config/nav2_params.yaml`, `FollowPath`):**
+switched MPPI to holonomic: `motion_model: "Omni"`, `vy_max: 0.10`,
+`vy_std: 0.15` (kept modest vs. `vx_max: 0.18` — mecanum rollers can still slip
+under lateral load on this floor, per Session 3 hardware-fix caution). Chosen
+scope: full Omni everywhere (not gated to near-goal only) — user's explicit
+choice over a near-goal-only gate. Existing critics
+(`GoalCritic`/`GoalAngleCritic` activate within `threshold_to_consider` 0.5/0.3m;
+`PathAlignCritic`/`PathFollowCritic` dominate during transit) already bias
+vy usage toward the final approach without a hard gate.
+
+**Fix applied #2 (same file, `controller_server`):** found and fixed a stale
+`min_y_velocity_threshold: 0.5` (leftover from when `vy_max` was 0). This
+thresholds the *odometry-read* y-velocity fed back to MPPI as its current-state
+estimate each control cycle (not the outgoing cmd_vel) — with `vy_max` now
+0.10, a 0.5 threshold would always report vy=0 to the controller regardless of
+real motion, silently defeating fix #1's feedback loop. Lowered to `0.01`.
+
+**Fix applied #3 (real bug found while verifying #2, `yahboomcar_base_node/src/base_node_X3.cpp`):**
+dispatched an Explore agent to trace the full cmd_vel/odom vy pipeline before
+trusting fixes #1/#2 live. Confirmed:
+- Command path is fine: Nav2 `/cmd_vel` → `Mcnamu_driver_X3.py:108-128`
+  (`cmd_vel_callback`) reads `vy = msg.linear.y`, applies trim, calls
+  `self.car.set_car_motion(vx, vy_corrected, w_corrected)` straight to the MCU
+  — vy is never zeroed or dropped here.
+- Feedback path was NOT fine: MCU-measured velocity → driver publishes
+  `vel_raw` (real vy) → `base_node_X3.cpp`'s `OdomPublisher` subscribes
+  `vel_raw`, integrates dead-reckoning pose correctly using the real
+  `linear_velocity_y_`, but published `nav_msgs/Odometry` on `odom_raw` with
+  the twist field hardcoded: `odom.twist.twist.linear.y = linear_velocity_y_;`
+  immediately followed by `odom.twist.twist.linear.y = 0.0; // vy = 0.0` (old
+  lines 126-127) — with a tight covariance (`odom.twist.covariance[7]:
+  0.0001`). `yahboomcar_bringup_X3_launch.py` feeds `odom_raw` into a
+  `robot_localization` `ekf_node` (`ekf_x1_x3.yaml`) whose `odom0_config` has
+  **vy fusion enabled** (index 7 = true), remapped to `/odom` — exactly the
+  topic Nav2's `controller_server` reads (`odom_topic: /odom` in
+  `nav2_params.yaml`). Net effect: the EKF was fusing a confidently-zero vy
+  measurement every cycle, so `/odom`'s reported y-velocity would always read
+  ~0 regardless of real strafe motion — actively undermining fix #1/#2 even
+  though the command path and position (x/y pose) integration were both
+  correct. **Not dead code — a live bug**, just invisible before strafe existed
+  because nobody looked at vy feedback when it was always commanded to 0
+  anyway.
+- **Fix:** deleted the hardcoded `odom.twist.twist.linear.y = 0.0;` override
+  (base_node_X3.cpp), letting the real `linear_velocity_y_` value survive into
+  the published message. Rebuilt clean:
+  `colcon build --symlink-install --packages-select yahboomcar_base_node`
+  (23s, only pre-existing unused-variable warnings, unrelated).
+
+**LIVE TEST RESULT (same day, after restarting t1/t4/t5 with all three fixes
+loaded):** mixed. Strafe visibly works and sometimes finds the right point
+efficiently by strafing directly. But intermittently, on a waypoint that
+should be trivial (goal ~10 inches straight ahead, same heading as current —
+no correction needed at all), the robot instead starts rotating and eventually
+fails to reach the target. User's own read: "it loses its actual location."
+Robot brought home and `t1`/`t5` stopped to investigate before continuing.
+
+**Root cause analysis (reasoning from code/config, not yet confirmed by live
+logs):** two candidate mechanisms considered —
+- **(A) Planner/controller motion-model mismatch (judged more likely, and
+  chosen to fix first):** `planner_server` was still `SmacPlannerHybrid` with
+  `motion_model_for_search: DUBIN` — a car-like, forward-only search with no
+  concept that this robot can strafe. `FollowPath`'s `PathAlignCritic`
+  (weight 14.0) and `PathFollowCritic` (weight 5.0) both dominate and push the
+  controller to imitate whatever path Hybrid-A* found. If the DUBIN search
+  snaps to a path with an unnecessary curve/rotation near the goal — plausible
+  even for a "trivial" waypoint, due to grid quantization — the controller
+  faithfully reproduces that spurious rotation instead of just strafing
+  straight there. This is structural (tied to specific waypoint geometry/grid
+  quantization), which fits the "sometimes great, sometimes awful" pattern
+  better than random noise would.
+- **(B) Position drift from mecanum slip during strafe:** checked
+  `ekf_x1_x3.yaml` — heading (yaw) is fused from the IMU only
+  (`odom0_config` has yaw index false), so a bad wheel-vy reading can't
+  directly corrupt heading in the EKF. It could still corrupt the estimated
+  x/y position between AMCL corrections (vx/vy are fused from `/odom_raw`
+  with a tight, never-revisited covariance), which could make Nav2 briefly
+  believe the goal isn't where it physically is. Considered less likely as
+  the *primary* cause (would look more like random per-run noise than a
+  waypoint-geometry-linked pattern) but not ruled out — worth checking
+  `/amcl_pose` stability during a future bad occurrence if (A) doesn't fully
+  resolve it.
+
+**Fix applied for (A) (`cat_patrol_robot/config/nav2_params.yaml`,
+`planner_server`):** reverted `GridBased.plugin` from
+`nav2_smac_planner/SmacPlannerHybrid` back to `nav2_navfn_planner/NavfnPlanner`
+— pure (x,y) Dijkstra/A* search, obstacle-aware, heading-blind. The whole
+reason for adopting SmacPlannerHybrid on 2026-07-10 was that a non-holonomic
+robot had no way to fix a large final-heading error except a slow
+post-arrival point-turn (wp5/wp6's 166-174°), so Hybrid-A* pre-solved
+orientation via a loop-around detour. That workaround assumed the robot
+couldn't strafe — no longer true now that `FollowPath.motion_model: Omni` is
+active. `PoseProgressChecker` (already credits in-place rotation as progress,
+set 2026-07-10) plus Omni MPPI should now close final position AND heading
+concurrently via a blended vx/vy/wz move, without needing the planner to
+invent a detour. Bonus: NavfnPlanner is far lighter on this CPU-constrained
+Orin NX (SmacPlannerHybrid was measured dropping to ~1.17Hz vs a 20Hz target).
+Old SmacPlannerHybrid config kept as a commented fallback block in the YAML,
+labeled to restore if this regresses wp5/wp6 specifically. YAML validated.
+**Config-only, no rebuild, requires a T4 restart. Not yet tested live.**
+
+**LIVE TEST OF THE PLANNER REVERT (same day): WORKED.** User confirmed the
+NavfnPlanner-back + Omni MPPI combo resolved the spurious-rotation-on-a-trivial-
+approach symptom — theory (A) confirmed as the real mechanism, no need to
+pursue theory (B) (localization/slip) for this specific symptom.
+
+**One remaining minor artifact, single occurrence:** at one waypoint the robot
+did a full unnecessary 360° turn before still successfully reaching the goal.
+Not investigated in depth (low severity — self-corrected, cycle succeeded).
+Plausible causes, not yet distinguished: (a) `TwirlingCritic`
+(weight 10.0, meant to discourage aimless spin) getting momentarily outvoted
+by `PathAlignCritic`/`GoalAngleCritic` on a short/degenerate path segment where
+NavfnPlanner's post-hoc per-pose orientation (filled in from the tangent
+between consecutive grid-resolution path points, since NavfnPlanner itself has
+no heading concept) is noisy for a very short hop, causing MPPI to chase a
+spurious intermediate heading before correcting; or (b) a one-off AMCL
+correction jump (residual theory (B) mechanism) making the robot briefly
+believe its heading was wrong. Left as a known open item — see open questions.
+
+**Status: strafe (Omni MPPI) + vy feedback fix + NavfnPlanner revert are ALL
+now confirmed working live.** Core Phase 4 wp5/wp6-era reliability problem
+appears resolved. Remaining open item is the single 360°-spin artifact above
+(cosmetic/minor, did not prevent success).
+
+- Scheduler repeat cycle: not reached yet this session
+- Callback-group/executor behavior under load: not reached yet this session
+- Notes: strafe-enable + planner-revert work took the whole session; live-
+  tested successfully same day. No full unattended (`loop_patrol: true`)
+  patrol cycle run yet with these changes — next session's natural next step.
 
 ### Final results
 
@@ -1417,6 +1538,13 @@ battery recharge first. Not yet tested live.**
 
 ## 12. Open questions / forward links
 
+- **Single unexplained 360° spin (2026-07-11).** One waypoint during the
+  successful strafe+NavfnPlanner live test made a full unnecessary in-place
+  rotation before still reaching the goal. Not yet root-caused (candidates:
+  TwirlingCritic momentarily outvoted, NavfnPlanner's post-hoc per-pose
+  orientation being noisy on a short path segment, or a one-off AMCL
+  correction jump). Low priority — cosmetic, self-corrected, didn't block the
+  cycle — but worth a closer look if it recurs or worsens.
 - **Phase 5 data flywheel.** Are captured waypoint photos sufficient quality
   for early cat-detector dataset bootstrapping?
 - **Phase 6 interruption model.** On cat detection, do we cancel active goal

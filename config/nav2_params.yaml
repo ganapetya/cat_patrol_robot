@@ -3,7 +3,9 @@
 # Localization half (map_server + amcl) is in amcl_params.yaml / Phase 2.
 # Adapted from yahboomcar_nav/params/dwa_nav_params.yaml for this robot:
 #   - costmaps consume /scan_filtered (trusted front arc), NOT /scan
-#   - strafe disabled (mecanum slips on smooth floor); forward+yaw only
+#   - strafe ENABLED (2026-07-11): MPPI motion_model=Omni, vy_max=0.10 — see
+#     FollowPath header below for why (closes the "lands beside the arrow"
+#     lateral-offset gap fast instead of a slow forward curve-in dance)
 #   - generous inflation + realistic footprint
 # ============================================================================
 
@@ -38,7 +40,12 @@ controller_server:
     use_sim_time: false
     controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
-    min_y_velocity_threshold: 0.5
+    # Was 0.5 — stale leftover from when vy_max was 0 (strafe off). This
+    # thresholds the *odometry-read* y-velocity fed back to MPPI as its
+    # current-state estimate each cycle (not the outgoing cmd_vel); with
+    # vy_max now 0.10 (strafe enabled, see FollowPath below), a 0.5 threshold
+    # would always report vy=0 to the controller regardless of actual motion.
+    min_y_velocity_threshold: 0.01
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
@@ -158,13 +165,26 @@ controller_server:
     # POST-HARDWARE-FIX (Session 3): the mis-mounted rear wheels that made turns
     # strafe are corrected, so in-place rotation AND arcs both work natively. The
     # Session-2 anti-spin / crawl / reverse TEST hacks have been reverted to sane
-    # defaults below. Optional modes if you want them:
+    # defaults below.
+    #
+    # STRAFE ENABLED (2026-07-11): motion_model=Omni, vy_max=0.10, vy_std=0.15.
+    # This robot is holonomic (mecanum) but MPPI was never letting it use vy —
+    # the "lands beside the arrow, right heading, wrong lateral offset, then
+    # grinds through a slow curve-in/rotate/creep dance" symptom (see
+    # phase4-status.md §11 "landed beside arrow") is exactly the case where a
+    # direct sideways nudge is the fast fix and forward-only motion is not.
+    # CAUTION carried over from Session 3 testing: mecanum rollers can slip on
+    # this smooth floor under lateral load — vy_max kept modest (0.10, well
+    # below vx_max 0.18) to limit slip risk; watch for drift/slip on the first
+    # live runs. Full Omni is enabled everywhere (not gated to near-goal only)
+    # per explicit choice — MPPI's own critics (GoalCritic/GoalAngleCritic
+    # activate within threshold_to_consider 0.5/0.3 m; PathAlignCritic/
+    # PathFollowCritic dominate during transit) already bias vy usage toward
+    # the final approach without a hard gate.
     #   - allow REVERSE:  vx_min: -0.10 + PreferForwardCritic.enabled: false +
     #     PathAngleCritic.mode: 1   (CAUTION: rear is lidar-blind — costmap is the
     #     /scan_filtered front arc only; reverse can't see obstacles behind.)
-    #   - allow STRAFE:   motion_model: "Omni" + vy_max: 0.10 + vy_std: 0.15
-    #     (works now, but mecanum rollers still slip on the smooth floor — keep
-    #     off unless needed.)
+    #   - disable STRAFE: motion_model: "DiffDrive" + vy_max: 0.0 + vy_std: 0.0
     # To flip to RPP/DWB: comment this block, uncomment a fallback above, restart T4.
     # ========================================================================
     FollowPath:
@@ -173,20 +193,21 @@ controller_server:
       model_dt: 0.1                   # MUST be >= controller period (1/10 = 0.1)
       batch_size: 1000               # modest for the 6-core Orin (default 2000)
       vx_std: 0.15
-      vy_std: 0.0                    # strafe sampling off (DiffDrive)
+      vy_std: 0.15                   # strafe sampling ON (Omni)
       wz_std: 0.2                    # standard yaw sampling
       vx_max: 0.18                   # cautious cruise (home with cats); crawl no
                                       # longer needed — turning traction is fixed.
       vx_min: 0.0                    # forward-only (rear is lidar-blind; see header
                                       # for how to allow reverse).
-      vy_max: 0.0                    # strafe off (DiffDrive; see header to enable).
+      vy_max: 0.10                   # strafe ON (Omni); modest vs vx_max — mecanum
+                                      # slip risk on smooth floor, see header.
       wz_max: 1.0                    # ~57 deg/s; in-place rotation works now.
       iteration_count: 1
       prune_distance: 1.5
       transform_tolerance: 0.2
       temperature: 0.3
       gamma: 0.015
-      motion_model: "DiffDrive"      # set "Omni" + vy_* to enable strafe
+      motion_model: "Omni"           # holonomic — strafe enabled (see header)
       visualize: false
       AckermannConstraints:
         min_turning_r: 0.0
@@ -319,45 +340,65 @@ planner_server:
     use_sim_time: false
     expected_planner_frequency: 20.0
     planner_plugins: ["GridBased"]
-    # SmacPlannerHybrid (not NavfnPlanner) — root-caused 2026-07-10: NavfnPlanner is a
-    # pure (x,y) Dijkstra/A* search with NO concept of heading, so it always draws the
-    # shortest straight-ish line to a waypoint's position and leaves the ENTIRE final
-    # orientation (e.g. wp5's 166°) to be resolved by in-place rotation after arrival —
-    # which is what caused the wp5/wp6 stalls. MPPI's own receding horizon (~1.5-3m) is
-    # also too short to discover a wide loop-around on its own. SmacPlannerHybrid
-    # searches in (x, y, heading) space, so it can plan a path that swings past a
-    # waypoint and approaches from the other side already facing the right way —
-    # exactly the maneuver observed by eye ("reachable if the bot goes further than
-    # wp5 and turns back"). motion_model_for_search=DUBIN (forward-only curves, no
-    # reverse) matches our rear-blind-lidar constraint.
+    # REVERTED to NavfnPlanner 2026-07-11 (was SmacPlannerHybrid). SmacPlannerHybrid
+    # was adopted 2026-07-10 specifically because a non-holonomic robot has no way to
+    # fix a large final-heading error (e.g. wp5's 166°) except a slow post-arrival
+    # in-place turn — Hybrid-A* solved that by planning a loop-around approach in
+    # (x,y,heading) space, forward-only (DUBIN). That whole workaround assumed the
+    # robot COULDN'T strafe. Now that MPPI's FollowPath is Omni (see below,
+    # 2026-07-11), the robot can close position AND heading concurrently via a
+    # blended vx/vy/wz move — it no longer needs the planner to pre-solve
+    # orientation via a detour. Live symptom that motivated reverting: with
+    # SmacPlannerHybrid + Omni both active, a waypoint that was trivially "10 inches
+    # straight ahead, same heading" sometimes made the robot rotate and fail —
+    # PathAlignCritic (weight 14.0)/PathFollowCritic (weight 5.0) faithfully
+    # imitating a DUBIN-searched path that occasionally snapped to an unnecessary
+    # curve/rotation near the goal (grid quantization near a trivial goal can still
+    # produce a non-straight primitive), even though a direct strafe was available
+    # and shorter. NavfnPlanner is a pure (x,y) Dijkstra/A* search — obstacle-aware,
+    # heading-blind, always draws the shortest path to the position and leaves final
+    # orientation entirely to the controller. `PoseProgressChecker` (credits
+    # in-place rotation as progress, set 2026-07-10) plus Omni MPPI should now
+    # converge on final heading via blended strafe+rotate instead of the old
+    # forward-only post-arrival point-turn that used to stall on SimpleProgressChecker.
+    # Bonus: NavfnPlanner is far lighter than Hybrid-A* on this CPU-constrained Orin
+    # NX (Hybrid-A* was measured dropping to ~1.17Hz vs a 20Hz target).
+    # NOT YET TESTED LIVE. If wp5/wp6-style large-final-heading waypoints regress
+    # (stall/abort instead of just turning in place via Omni), that's the signal to
+    # revert this block and restore SmacPlannerHybrid below instead.
     GridBased:
-      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 0.5
+      use_astar: false
       allow_unknown: true
-      max_iterations: 1000000
-      max_on_approach_iterations: 1000
-      max_planning_time: 5.0
-      motion_model_for_search: "DUBIN"   # forward-only curves — no reverse (rear is lidar-blind)
-      angle_quantization_bins: 72        # 5 deg heading resolution
-      minimum_turning_radius: 0.10       # small: robot can rotate in place, this just
-                                         # bounds how tight Hybrid-A*'s analytic curves are
-      analytic_expansion_ratio: 3.5
-      analytic_expansion_max_length: 3.0
-      reverse_penalty: 2.0
-      change_penalty: 0.0
-      non_straight_penalty: 1.2
-      cost_penalty: 2.0
-      cache_obstacle_heuristic: false
-      debug_visualizations: false
-      # REVERTED 2026-07-10 (was downsample_costmap:true/factor:2): halving the
-      # planning grid to 10cm cells is the likely cause of "lands next to the
-      # waypoint arrow, correct heading, but laterally offset" — Hybrid-A*'s
-      # analytic expansion isn't cleanly reaching the exact continuous goal
-      # near tight spots, so it snaps to the coarser quantized grid node
-      # instead. Trading CPU for positional precision; revisit if planner
-      # loop rate becomes a bigger problem than this.
-      downsample_costmap: false
-      downsampling_factor: 1
+
+    # ========================================================================
+    # FALLBACK PLANNER: SmacPlannerHybrid (Hybrid-A*, x/y/heading search, DUBIN
+    # forward-only). Restore this (and comment NavfnPlanner above) if reverting to
+    # NavfnPlanner reintroduces the wp5/wp6 large-final-rotation stalls it was
+    # originally built to fix. Config-only, requires a T4 restart either way.
+    # ========================================================================
+    # GridBased:
+    #   plugin: "nav2_smac_planner/SmacPlannerHybrid"
+    #   tolerance: 0.5
+    #   allow_unknown: true
+    #   max_iterations: 1000000
+    #   max_on_approach_iterations: 1000
+    #   max_planning_time: 5.0
+    #   motion_model_for_search: "DUBIN"   # forward-only curves — no reverse (rear is lidar-blind)
+    #   angle_quantization_bins: 72        # 5 deg heading resolution
+    #   minimum_turning_radius: 0.10       # small: robot can rotate in place, this just
+    #                                      # bounds how tight Hybrid-A*'s analytic curves are
+    #   analytic_expansion_ratio: 3.5
+    #   analytic_expansion_max_length: 3.0
+    #   reverse_penalty: 2.0
+    #   change_penalty: 0.0
+    #   non_straight_penalty: 1.2
+    #   cost_penalty: 2.0
+    #   cache_obstacle_heuristic: false
+    #   debug_visualizations: false
+    #   downsample_costmap: false
+    #   downsampling_factor: 1
 
 behavior_server:
   ros__parameters:
