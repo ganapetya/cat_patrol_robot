@@ -2,6 +2,7 @@
 
 <p align="left">
   <img src="images/botph.jpeg" width="200" alt="The robot, side view" />
+  <img src="images/maps.png" width="200" alt="The Patrol Map" /> 
 </p>
 
 ## What this project is
