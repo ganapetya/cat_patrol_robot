@@ -8,14 +8,16 @@ Phase 4 = build a **Nav2-native patrol manager** that wakes on schedule,
 drives through recorded waypoints, captures photos at each waypoint, returns
 home, sends one email bundle, and goes back to sleep.
 
-> **STATUS: PAUSED for battery recharge (2026-07-10 end of Session 2).**
-> A full cycle has succeeded once (home + per-waypoint mail). wp5/wp6 are
-> still unreliable — four fixes have been applied in sequence, each addressing
-> a real bug found along the way, but the last one (goal-tolerance +
-> full-resolution planning) has **not been tested live yet**. Stall guard is
-> validated working (correctly fired on an 11.1V battery drop). See
-> **§11.5 RESUME CHECKLIST** for exactly what to do next, and §11 Session 2
-> for the full diagnostic trail with log evidence.
+> **STATUS: PHASE 4 REACHED (2026-07-17, Session 4).**
+> All required acceptance criteria (§2) are now confirmed live: full waypoint
+> cycles complete reliably (strafe + NavfnPlanner + vy-feedback fix, proven
+> Session 3), per-waypoint capture/mail works, home-return works, the stall
+> guard is validated, and — the last open item — continuous unattended
+> looping (`loop_patrol=true`, 10s pause between cycles, repeating until the
+> `t5_patrol.sh` process is stopped) is now confirmed working live. See
+> §11 Session 4 for the looping fix and §11.5/Sessions 1–3 for the full
+> diagnostic trail behind the earlier reliability fixes. Remaining items are
+> stretch/nice-to-have (§2) and forward links into Phase 5/6/7 (§12).
 
 ---
 
@@ -55,15 +57,20 @@ home, sends one email bundle, and goes back to sleep.
 Phase 4 is done when all required items pass:
 
 ### Required
-- [ ] `patrol_manager` package builds and launches cleanly.
-- [ ] Node reaches `SLEEPING` after startup and wakes itself by timer.
-- [ ] On wake, it sends Nav2 goals for all configured waypoints in order.
-- [ ] At each waypoint, one photo is saved to disk and path appended to cycle list.
-- [ ] After last waypoint, robot navigates to home pose.
-- [ ] After arriving home, exactly one mail request is published with all photo paths.
-- [ ] FSM returns to `SLEEPING` and repeats next cycle (if `loop_patrol=true`).
-- [ ] No raw `/cmd_vel` publishes from `patrol_manager` (Nav2-only movement).
-- [ ] Executor remains responsive during active navigation (no callback starvation).
+- [x] `patrol_manager` package builds and launches cleanly.
+- [x] Node reaches `SLEEPING` after startup and wakes itself by timer.
+- [x] On wake, it sends Nav2 goals for all configured waypoints in order.
+- [x] At each waypoint, one photo is saved to disk and path appended to cycle list.
+- [x] After last waypoint, robot navigates to home pose.
+- [x] After arriving home, one mail request is published per captured
+      waypoint photo (design changed from one bundled mail to per-waypoint
+      mail per explicit user request, Session 2 — see §11 Session 2; intent
+      of the criterion — photos reliably emailed — is met).
+- [x] FSM returns to `SLEEPING` and repeats next cycle (if `loop_patrol=true`)
+      — confirmed live 2026-07-17 (Session 4): continuous looping with a 10s
+      pause between cycles, running until `t5_patrol.sh` is stopped.
+- [x] No raw `/cmd_vel` publishes from `patrol_manager` (Nav2-only movement).
+- [x] Executor remains responsive during active navigation (no callback starvation).
 
 ### Nice-to-have (stretch)
 - [ ] Publish patrol telemetry (current waypoint index, distance remaining,
@@ -1533,6 +1540,49 @@ appears resolved. Remaining open item is the single 360°-spin artifact above
 - capture success rate per cycle: ___
 - unattended cycle: PASS / blockers ___
 - Phase 4 acceptance criteria: all met / blockers ___
+
+---
+
+### Session 4 — 2026-07-17
+
+**User request:** turn the proven single-cycle run (loop_patrol=false) into a
+real continuous loop — repeat cycles back-to-back until `t5_patrol.sh` is
+killed, with a short pause between runs (10s), instead of waiting on the
+30-minute `patrol_period_sec` schedule timer.
+
+**Root cause of why this didn't already work:** `loop_patrol_` was declared
+and read from params but never actually consulted anywhere except a log
+line in `send_home_goal()`'s success branch — it didn't gate anything. The
+only thing that ever re-armed `wake_requested_` was `wake_timer_`, a
+periodic (non-one-shot) wall timer firing every `patrol_period_sec_` (1800s
+default) regardless of `loop_patrol_`.
+
+**Fix applied (`patrol_manager_node.cpp`, `patrol_manager_params.yaml`):**
+- New param `patrol_pause_sec` (default 10.0).
+- New `schedule_next_cycle()`: one-shot wall timer (cancels itself on first
+  fire) that sets `wake_requested_ = true` after `patrol_pause_sec_`.
+- `send_home_goal()`'s success branch now actually branches on
+  `loop_patrol_`: true → log + `schedule_next_cycle()` (next cycle starts
+  ~10s after arriving home); false → stays asleep as before (unchanged
+  behavior, still the safe single-cycle default for a first run).
+- Home-goal **failure** and the stall guard's forced-SLEEPING path are
+  deliberately left as hard stops (no auto re-wake) — those indicate a real
+  problem worth an operator look, so they don't feed back into the loop.
+- `patrol_manager_params.yaml`: `loop_patrol: false` → `true`, added
+  `patrol_pause_sec: 10.0`.
+- Old `wake_timer_`/`patrol_period_sec_` scheduled-wake mechanism left
+  in place untouched (still useful as a first-wake / long-idle-recovery
+  backstop); harmless overlap with the new pause timer since both just set
+  the same `wake_requested_` flag.
+- Rebuilt clean: `colcon build --symlink-install --packages-select
+  patrol_manager` (~35s, no errors).
+
+**LIVE TEST CONFIRMED (same day):** brought up t1→t5 with `loop_patrol: true`
+and `patrol_pause_sec: 10.0`. The FSM cycles
+`SLEEPING → WAKING → … → RETURNING → SLEEPING → (10s pause) → WAKING → …`
+repeatedly and unattended, running continuously until `t5_patrol.sh` is
+stopped, as requested. **This was the last open item blocking Phase 4 — all
+required acceptance criteria (§2) are now met. Phase 4 reached.**
 
 ---
 
