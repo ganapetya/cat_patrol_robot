@@ -13,7 +13,14 @@ Phase 5 = build the **vision pipeline**. Two sub-stages:
   C++ learning exercise) front the detector with a producer-consumer image
   pipeline that drops stale frames under load.
 
-> **STATUS: 5a VERIFIED WORKING LIVE (2026-07-18). 5b not started.**
+> **STATUS: 5a VERIFIED WORKING LIVE (2026-07-18). 5b VERIFIED WORKING LIVE
+> (2026-07-21): dataset built, MobileNetV2 classifier trained (81.8% test
+> acc on a small 11-image held-out set), wired into `detector_node.py`, and
+> confirmed live -- publishing a known white-cat photo and a known
+> brown-cat photo through the running node correctly logged "Cat sighting
+> started (white)" and "(brown)" respectively. Not yet tested against the
+> live Astra camera feed (only static test photos so far) or across a full
+> patrol cycle.**
 > Both `cat_detector` (Python) and `cat_detector_cpp` (C++) are built and
 > confirmed live against the real Astra camera and a real cat: correct
 > generic-cat detection, sighting-throttled saves, retention cap, audible
@@ -890,6 +897,109 @@ hz /cmd_vel` and the `t4_nav` terminal for rate warnings the first few times.
   re-stopped it per operator preference after testing (kept **stopped**, per
   final instruction).
 
+### Session 2 — 2026-07-21
+
+- Cat names: still generic "white"/"brown" in code and data dirs -- user
+  chose not to introduce real names, keep it simple.
+- Photo transfer: user copied 46 white-cat + 28 brown-cat photos from host
+  to `~/cats/white/` and `~/cats/brown/` via rsync/scp (mixed `.jpg`/`.jpeg`/
+  `.JPG` extensions, all handled).
+- `collect_dataset.py` rewritten to handle two kinds of sources: pre-labeled
+  (`~/cats/white`, `~/cats/brown` -> crop straight into `dataset/<label>/`,
+  passthrough uncropped if YOLO finds no box rather than dropping the photo)
+  and unlabeled flywheel dirs (`captures/`, `detections/`, `detections_cpp/`
+  -> `dataset/unsorted/` for manual review). Idempotent re-runs via a
+  `__crop<n>`/`passthrough__` filename marker.
+- First run produced `dataset/white` (46), `dataset/brown` (28),
+  `dataset/unsorted` (45, later found 24 were exact-duplicate crops of
+  photos already in `dataset/white` -- see below -- removed, leaving 21).
+- **Finding: most "white cat" host photos were already-known robot data.**
+  24 of the 46 white-cat photos had the exact filename pattern
+  `cat_YYYYMMDD_HHMMSS_mmm.jpg` that `detector_node.py`/`detector_node.cpp`
+  generate, and were confirmed byte-identical to files already in
+  `~/cat_patrol_data/detections*`. So the user's "many white cat photos"
+  were substantially the Session 1 flywheel captures, not new deliberate
+  shots -- true novel white-cat data is closer to ~12-22 images. Brown
+  barely overlapped (3 of 28).
+- User decided **not** to manually sort the remaining 21 `dataset/unsorted/`
+  crops -- 74 pre-labeled images was judged enough to start, and sorting 21
+  more images by eye (via rsync round-trip to the host, since the Jetson has
+  no display) wasn't worth it right now. `dataset/unsorted/` deleted.
+- `train_classifier.py` written: MobileNetV2 (ImageNet-pretrained, frozen
+  backbone, fine-tune only the linear head -- appropriate given ~75 total
+  images), group-aware train/val/test split (60s sighting buckets so
+  near-duplicate frames from one sighting can't leak across the split, per
+  the dedup warning in §2), mild augmentation (flip/rotation/brightness) with
+  **no hue/saturation jitter** since color is the actual class signal.
+  Trained 25 epochs, best val checkpoint kept. **Test acc 81.8% (9/11)**,
+  all errors brown->white (see §11 5b final results above for full
+  breakdown). Saved to
+  `cat_detector/models/cat_id_classifier.pt` + `.json` metadata.
+- **Classifier wired into `detector_node.py`**: after YOLO finds a "cat" box,
+  the box (padded by `ID_CROP_PAD_FRAC=0.15`, matching `collect_dataset.py`'s
+  `PAD_FRAC` so live crops match the training distribution) is cropped and
+  run through the MobileNetV2 classifier. Result is appended as a *second*
+  `ObjectHypothesisWithPose` on the same `Detection2D` (first stays
+  `class_id="15"` for back-compat with any generic-cat consumer), so Phase 6
+  can read either the generic detection or the per-cat identity without a
+  message-contract change. New params: `enable_identification` (default
+  true), `classifier_model_path`. Falls back to identification-disabled with
+  a warning if the `.pt` file is missing, rather than crashing the node.
+  Annotated image now also gets the label+confidence drawn on it
+  (`cv2.putText`), and saved detection filenames get a `_white`/`_brown`
+  suffix (after the timestamp, so `_enforce_retention`'s chronological sort
+  still works) for easier dataset review later.
+- **Verified live** (not just built): built `cat_detector` cleanly, launched
+  the real node, and used a new helper script (`publish_test_image.py` --
+  publishes one static JPEG on `/camera/color/image_raw` repeatedly, no
+  camera hardware needed) to replay one known white-cat photo and one known
+  brown-cat photo through the running node. Log output confirmed: `Cat
+  sighting started (white)` for the white photo, `Cat sighting started
+  (brown)` for the brown photo -- correct both directions, end to end
+  (YOLO detect -> crop -> classify -> beep/save/log). One test photo choice
+  mattered: the first photo tried had been a `passthrough__` file during
+  `collect_dataset.py` (no cat found even at conf=0.25), so naturally
+  produced 0 detections live too at the stricter conf=0.45 -- picked a
+  different, actually-detected photo and it worked immediately. Test
+  artifacts (saved frames, logs) cleaned up after; `publish_test_image.py`
+  kept as a permanent script (bench-testing any image subscriber without
+  live camera hardware).
+- **Ported identification to `cat_detector_cpp` too** (user asked whether
+  the C++ node also had it -- it didn't, this was a separate follow-up).
+  `cat_detector_cpp` has no libtorch dependency (only `cv::dnn`, per §14b),
+  so `cat_id_classifier.pt` can't be loaded directly in C++ -- new
+  `export_classifier_onnx.py` exports it to ONNX the same way `yolov8n.onnx`
+  was exported. Verified numerically before touching C++: compared
+  PyTorch-vs-cv::dnn logits on 6 real crops, using `cv2.dnn.blobFromImage`
+  for the NHWC->NCHW/batch step but manual per-channel mean/std math (a
+  single `blobFromImage` scalefactor can't do ImageNet's per-channel std
+  division). Absolute logit values differ a bit between backends (PIL vs
+  OpenCV resize aren't bit-exact), but predicted class matched on every one
+  of the 6 test crops. `INTER_AREA` was picked for the downscale specifically
+  because a bench comparison showed it tracks PIL's antialiased
+  `Resize(256)` noticeably closer than `INTER_LINEAR`.
+  `detector_node.cpp` changes: `crop_for_identification` (pads by
+  `kIdCropPadFrac=0.15`, matching Python/`collect_dataset.py`),
+  `preprocess_for_classifier` (resize-256-shortest-side + center-crop-224 +
+  manual ImageNet normalize), `classify_crop` (forward pass + manual
+  softmax since the exported graph has no softmax layer). New params:
+  `enable_identification`, `classifier_model_path`, `classifier_classes`
+  (order must match `export_classifier_onnx.py`'s printed class order --
+  currently `["brown", "white"]`). Same fallback behavior as Python: missing
+  classifier file -> warn and disable, not crash.
+  **Verified live**: built cleanly (`colcon build --packages-select
+  cat_detector_cpp`), launched the real node, replayed the same known
+  white/brown test photos via `publish_test_image.py` (works for either
+  detector, it just publishes on the shared `/camera/color/image_raw`
+  topic) -- logged `Cat sighting started (white)` and `(brown)` correctly,
+  same as the Python node. Saved-frame filenames also get the
+  `_white`/`_brown` suffix now, matching the Python side.
+- Next: run this live against the real Astra camera (not just a static
+  photo) and, ideally, get a real-world read on accuracy beyond the 11-image
+  test set -- watch the annotated image / logs during normal patrol and see
+  how often the identification looks right by eye. This applies to both
+  detectors now.
+
 ### 5a final results
 - Model / imgsz: YOLOv8n / 640×640 (`yolov8n.pt` for Python, `yolov8n.onnx`
   export for C++)
@@ -908,12 +1018,33 @@ hz /cmd_vel` and the `t4_nav` terminal for rate warnings the first few times.
   GPU inference) was met a different way.
 
 ### 5b final results
-- Dataset size (per cat, train/val/test): ___
-- Model type (crop-classifier / 2-class YOLO): ___
-- Test accuracy + confusion matrix: ___
-- Drop-stale verified (no unbounded growth under load): yes/no
-- C++ producer-consumer built (stretch): yes/no
-- 5b acceptance: met / blockers ___
+- Dataset size (per cat, train/val/test): brown 28 photos, white 46 photos
+  (raw counts before crop; note ~34 of the "white" photos turned out to be
+  exact-duplicate re-copies of frames the robot itself had already saved to
+  `~/cat_patrol_data/detections*` during Session 1 -- so genuinely novel
+  white-cat data is closer to ~12 deliberate photos, not 46. Brown barely
+  overlapped, ~25 of 28 were new). Group-aware split (60s sighting buckets
+  so near-duplicate frames never cross train/test): train 56, val 7, test 11.
+- Model type: crop-classifier (MobileNetV2, ImageNet-pretrained, backbone
+  frozen, only the final linear head fine-tuned -- chosen over 2-class YOLO
+  because the dataset is far too small, ~75 images total, to retrain a
+  detection head reliably). `train_classifier.py` (§6f note: this superseded
+  the collect_dataset.py described there being unsorted-only -- it also
+  handles pre-labeled sources, see script docstring for both source kinds).
+- Test accuracy + confusion matrix: **81.8%** (9/11). Confusion (rows=true,
+  cols=pred): brown -> [5 brown, 2 white], white -> [0 brown, 4 white]. All
+  errors were brown misclassified as white, none the other way -- worth
+  watching as more data comes in (could be sample noise given the tiny
+  11-image test set, or a real lighting/background confusion). Not a
+  precise number given how few test images there are; treat as a rough
+  first-pass signal, re-evaluate once more real sightings accumulate.
+- Drop-stale verified (no unbounded growth under load): not yet re-verified
+  with the classifier wired in -- carries over from 5a's queue-of-1 design
+  (§6c), same mechanism, classifier adds one more (small) synchronous step
+  per detected frame.
+- C++ producer-consumer built (stretch): no.
+- 5b acceptance: **dataset + model done, integration into detector_node.py
+  in progress** -- see below for wiring status once complete.
 
 ---
 
