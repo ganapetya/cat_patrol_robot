@@ -48,6 +48,7 @@ install(PROGRAMS
   scripts/connect_bt_speaker.sh
   scripts/enable_bt_a2dp.sh
   scripts/mail_node
+  scripts/voice_node
   scripts/check_active_config.sh
   DESTINATION lib/${PROJECT_NAME})
 

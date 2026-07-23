@@ -3,6 +3,7 @@
 <p align="left">
   <img src="images/botph.jpeg" width="200" alt="The robot, side view" />
   <img src="images/maps.png" width="200" alt="The Patrol Map" /> 
+  <video src="video/CATS.mp4" width="300" controls></video>
 </p>
 
 ## What this project is

@@ -1,0 +1,10 @@
+cat_voice:
+  ros__parameters:
+    detections_topic: "/cat_detector_cpp/detections"
+    voices_dir: "/home/jetson/cats/voices"
+    # Identity confidence must clear this bar before a line plays -- keeps
+    # a shaky low-confidence frame from picking the wrong cat's voice.
+    min_identity_conf: 0.6
+    # Minimum seconds between two lines for the SAME cat -- a lingering
+    # sighting shouldn't retrigger every frame.
+    cooldown_sec: 15.0
