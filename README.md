@@ -6,7 +6,7 @@
 </p>
 
 <p align="left">
-[![Watch the video](video/cat.jpeg)](https://youtu.be/mToPNqys4iA)
+[Watch the video](https://youtu.be/mToPNqys4iA)
 </p>
 
 ## What this project is
