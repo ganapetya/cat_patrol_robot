@@ -158,6 +158,16 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   mail_to_ = declare_parameter<std::string>("smtp_to_address", "user@example.com");
   // Topic where an external cat-detection node publishes true/false.
   cat_detected_topic_ = declare_parameter<std::string>("cat_detected_topic", "/cat_patrol/cat_detected");
+  // cat_detector_cpp's per-frame detections (carries the white/brown identity).
+  detections_topic_ = declare_parameter<std::string>(
+    "detections_topic", "/cat_detector_cpp/detections");
+  // Email one snapshot when a white/brown cat is recognized DURING a patrol.
+  cat_recognized_mail_enabled_ = declare_parameter<bool>("cat_recognized_mail_enabled", true);
+  cat_recognized_min_conf_ = declare_parameter<double>("cat_recognized_min_conf", 0.6);
+  cat_recognized_cooldown_sec_ =
+    declare_parameter<double>("cat_recognized_cooldown_sec", 30.0);
+  // Email one snapshot at the start and end of every patrol loop.
+  loop_boundary_mail_enabled_ = declare_parameter<bool>("loop_boundary_mail_enabled", true);
   // Battery voltage topic (published by Mcnamu_driver_X3 as Float32 on "voltage")
   voltage_topic_ = declare_parameter<std::string>("voltage_topic", "voltage");
   low_voltage_warn_v_ = declare_parameter<double>("low_voltage_warn_v", 11.0);
@@ -341,6 +351,16 @@ PatrolNode::PatrolNode(const rclcpp::NodeOptions & options)
   cat_sub_ = create_subscription<std_msgs::msg::Bool>(
     cat_detected_topic_, 10, std::bind(&PatrolNode::cat_detected_cb, this, std::placeholders::_1));
 
+  // Cat IDENTITY subscriber: cat_detector_cpp publishes a Detection2DArray per
+  // frame with the white/brown identity in results[1]. detections_cb() emails a
+  // snapshot when a confident identity arrives mid-patrol. Only created when the
+  // feature is enabled so we don't subscribe for nothing.
+  if (cat_recognized_mail_enabled_) {
+    detections_sub_ = create_subscription<vision_msgs::msg::Detection2DArray>(
+      detections_topic_, 10,
+      std::bind(&PatrolNode::detections_cb, this, std::placeholders::_1));
+  }
+
   // Battery voltage subscriber (driver publishes ~10 Hz). Used to surface
   // gradual turn degradation that is actually caused by low battery.
   voltage_sub_ = create_subscription<std_msgs::msg::Float32>(
@@ -519,6 +539,11 @@ void PatrolNode::transition_to(PatrolState s)
   // ALWAYS stop the wheels before doing anything else.
   stop_robot();
 
+  // Remember where we came FROM before overwriting state_, so the
+  // loop-boundary emails below can tell a real cycle start/end apart from
+  // mid-cycle re-entries (e.g. CatApproach → Patrol) and the startup Idle.
+  const PatrolState prev = state_;
+
   // Update the state and record when we entered it.
   state_ = s;
   state_enter_time_ = now();
@@ -529,6 +554,17 @@ void PatrolNode::transition_to(PatrolState s)
     saved_paths_.clear();
     frames_saved_ = 0;
     cat_detected_.store(false);
+
+    // Loop START email: only when a NEW cycle begins (from Idle / first-boot
+    // WaitingForTf), not when CatApproach hands control back to Patrol.
+    if (loop_boundary_mail_enabled_ &&
+        (prev == PatrolState::Idle || prev == PatrolState::WaitingForTf))
+    {
+      const std::string path = save_snapshot("loopstart");
+      if (!path.empty()) {
+        send_mail_request({path}, mail_subject_ + " — patrol loop started");
+      }
+    }
 
     if (get_odom_pose(home_x_, home_y_, home_yaw_)) {
       RCLCPP_INFO(get_logger(),
@@ -554,6 +590,22 @@ void PatrolNode::transition_to(PatrolState s)
     // Start in the "Snap" sub-phase (take a picture first, then rotate).
     capture_phase_ = CapturePhase::Snap;
     RCLCPP_INFO(get_logger(), "Capture: will take %d images over 360 degrees", capture_frame_count_);
+  }
+
+  if (s == PatrolState::Idle) {
+    // Loop END email: only when we return to Idle after a cycle actually ran
+    // (Patrol / Capture / ReturnHome / CatApproach). This covers both the
+    // till-obstacle pattern (Patrol → Idle via DoneIdle) and the classic
+    // pattern (… → ReturnHome → Idle), while skipping the startup Idle.
+    if (loop_boundary_mail_enabled_ &&
+        (prev == PatrolState::Patrol || prev == PatrolState::Capture ||
+         prev == PatrolState::ReturnHome || prev == PatrolState::CatApproach))
+    {
+      const std::string path = save_snapshot("loopend");
+      if (!path.empty()) {
+        send_mail_request({path}, mail_subject_ + " — patrol loop ended");
+      }
+    }
   }
 
   if (s == PatrolState::CatApproach) {
@@ -898,6 +950,73 @@ void PatrolNode::cat_detected_cb(const std_msgs::msg::Bool::SharedPtr msg)
 }
 
 // ===========================================================================
+// detections_cb — email a snapshot when a white/brown cat is recognized
+// ===========================================================================
+// WHEN:  Called on every Detection2DArray published by cat_detector_cpp.
+//
+// WHAT:  Mirrors voice_node.py's logic: each Detection2D carries a generic
+//        "cat" hypothesis in results[0] and, when the per-cat classifier
+//        fired, a white/brown identity in results[1]. We pick the highest-
+//        confidence identity across all boxes in the frame and, if it clears
+//        cat_recognized_min_conf_, email one snapshot of the current camera
+//        frame.
+//
+// GATING: Only while a patrol cycle is actively running (is_patrolling), and
+//        at most once per cat every cat_recognized_cooldown_sec_ seconds so a
+//        lingering sighting doesn't email every inference frame.
+// ===========================================================================
+void PatrolNode::detections_cb(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
+{
+  // Feature off, or no camera frame to attach yet — nothing to do.
+  if (!cat_recognized_mail_enabled_) {
+    return;
+  }
+  // Only react during an active patrol (matches the chosen behavior).
+  if (!is_patrolling()) {
+    return;
+  }
+
+  // Best (highest-confidence) identity across all boxes in this frame.
+  std::string best_label;
+  double best_conf = -1.0;
+  for (const auto & det : msg->detections) {
+    if (det.results.size() < 2) {
+      continue;  // identification didn't fire for this box
+    }
+    const auto & id_hyp = det.results[1].hypothesis;
+    if ((id_hyp.class_id == "white" || id_hyp.class_id == "brown") &&
+        id_hyp.score > best_conf)
+    {
+      best_label = id_hyp.class_id;
+      best_conf = id_hyp.score;
+    }
+  }
+
+  if (best_label.empty() || best_conf < cat_recognized_min_conf_) {
+    return;
+  }
+
+  // Per-cat cooldown so one lingering sighting doesn't email every frame.
+  const rclcpp::Time tnow = now();
+  const auto it = last_cat_mail_.find(best_label);
+  if (it != last_cat_mail_.end() &&
+      (tnow - it->second).seconds() < cat_recognized_cooldown_sec_)
+  {
+    return;
+  }
+
+  const std::string path = save_snapshot("cat_" + best_label);
+  if (path.empty()) {
+    return;  // no camera frame available; try again on the next detection
+  }
+
+  last_cat_mail_[best_label] = tnow;
+  RCLCPP_INFO(get_logger(), "Recognized %s cat (%.2f) — emailing snapshot",
+              best_label.c_str(), best_conf);
+  send_mail_request({path}, mail_subject_ + " — " + best_label + " cat recognized");
+}
+
+// ===========================================================================
 // voltage_cb — store battery voltage; warn on low voltage (throttled)
 // ===========================================================================
 // WHY:  Yahboom X3 motor torque/speed drops with battery voltage. As the
@@ -1112,16 +1231,24 @@ std::string PatrolNode::escape_json(const std::string & s) const
 // ===========================================================================
 void PatrolNode::send_mail_request()
 {
+  // The default request emails the 360° capture batch with the configured
+  // subject. Everything is delegated to the explicit-arg overload below.
+  send_mail_request(saved_paths_, mail_subject_);
+}
+
+void PatrolNode::send_mail_request(
+  const std::vector<std::string> & paths, const std::string & subject)
+{
   std::ostringstream oss;
   // Build the JSON object piece by piece.
-  oss << "{\"subject\":\"" << escape_json(mail_subject_) << "\","
+  oss << "{\"subject\":\"" << escape_json(subject) << "\","
       << "\"to\":\"" << escape_json(mail_to_) << "\","
       << "\"paths\":[";
-  for (size_t i = 0; i < saved_paths_.size(); ++i) {
+  for (size_t i = 0; i < paths.size(); ++i) {
     if (i > 0) {
       oss << ",";  // JSON arrays need commas between elements.
     }
-    oss << "\"" << escape_json(saved_paths_[i]) << "\"";
+    oss << "\"" << escape_json(paths[i]) << "\"";
   }
   oss << "]}";
 
@@ -1129,7 +1256,8 @@ void PatrolNode::send_mail_request()
   std_msgs::msg::String out;
   out.data = oss.str();
   mail_pub_->publish(out);
-  RCLCPP_INFO(get_logger(), "Published mail request (%zu attachments)", saved_paths_.size());
+  RCLCPP_INFO(get_logger(), "Published mail request \"%s\" (%zu attachments)",
+              subject.c_str(), paths.size());
 }
 
 // ===========================================================================
@@ -1379,17 +1507,17 @@ void PatrolNode::capture_tick()
 //   because we only READ the data (we don't modify it).  This is a common
 //   pattern when interfacing ROS with OpenCV.
 // ===========================================================================
-bool PatrolNode::save_current_image()
+bool PatrolNode::last_image_to_bgr(cv::Mat & out)
 {
   if (!last_image_) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-      "save_current_image: last_image_ is null — no frames received on topic '%s'. "
+      "last_image_to_bgr: last_image_ is null — no frames received on topic '%s'. "
       "Check camera is publishing color images.", image_topic_.c_str());
     return false;
   }
   if (last_image_->width == 0 || last_image_->height == 0 || last_image_->data.empty()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-      "save_current_image: image has no pixel data (w=%u h=%u data_size=%zu)",
+      "last_image_to_bgr: image has no pixel data (w=%u h=%u data_size=%zu)",
       last_image_->width, last_image_->height, last_image_->data.size());
     return false;
   }
@@ -1440,6 +1568,17 @@ bool PatrolNode::save_current_image()
     return false;
   }
 
+  out = bgr_image;
+  return true;
+}
+
+bool PatrolNode::save_current_image()
+{
+  cv::Mat bgr_image;
+  if (!last_image_to_bgr(bgr_image)) {
+    return false;
+  }
+
   // Build the file path: /tmp/cat_patrol_images/snap_<timestamp>_<count>.jpg
   std::filesystem::path dir(image_save_dir_);
   std::ostringstream fname;
@@ -1453,6 +1592,37 @@ bool PatrolNode::save_current_image()
     return true;
   }
   return false;  // imwrite failed (disk full, permissions, etc.)
+}
+
+// save_snapshot — save the current frame as a standalone "<tag>_<ts>.jpg".
+// Unlike save_current_image, it does NOT append to saved_paths_ or bump
+// frames_saved_ — those belong to the 360° capture batch, which the
+// loop-boundary and cat-recognized emails must not disturb.
+std::string PatrolNode::save_snapshot(const std::string & tag)
+{
+  cv::Mat bgr_image;
+  if (!last_image_to_bgr(bgr_image)) {
+    return "";
+  }
+
+  std::filesystem::path dir(image_save_dir_);
+  std::ostringstream fname;
+  fname << tag << "_" << now().nanoseconds() << ".jpg";
+  std::filesystem::path fp = dir / fname.str();
+
+  if (cv::imwrite(fp.string(), bgr_image)) {
+    return fp.string();
+  }
+  RCLCPP_WARN(get_logger(), "save_snapshot: cv::imwrite failed for %s", fp.string().c_str());
+  return "";
+}
+
+// is_patrolling — true whenever a patrol cycle is actively running. Used to
+// gate the cat-recognized email so it never fires while the robot is idle.
+bool PatrolNode::is_patrolling() const
+{
+  return state_ == PatrolState::Patrol || state_ == PatrolState::Capture ||
+         state_ == PatrolState::ReturnHome || state_ == PatrolState::CatApproach;
 }
 
 // ===========================================================================

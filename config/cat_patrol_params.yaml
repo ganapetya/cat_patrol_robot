@@ -324,6 +324,17 @@
     mail_subject: "Cat patrol photos"
     smtp_to_address: "peter.botnet@gmail.com"
 
+    # --- Extra snapshot emails (all reuse the mail_subject above as a prefix) ---
+    # One snapshot at the START and the END of every patrol loop.
+    loop_boundary_mail_enabled: true
+    # One snapshot when cat_detector_cpp recognizes a white/brown cat DURING a
+    # patrol. Reads the identity from results[1] on detections_topic. The 360°
+    # capture-at-waypoint email is unaffected and still sent as before.
+    detections_topic: "/cat_detector_cpp/detections"
+    cat_recognized_mail_enabled: true
+    cat_recognized_min_conf: 0.6      # Identity confidence bar before emailing
+    cat_recognized_cooldown_sec: 30.0 # Min seconds between emails for the SAME cat
+
     # =========================================================================
     # CAT DETECTION (optional, advanced)
     # =========================================================================

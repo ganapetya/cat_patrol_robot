@@ -34,7 +34,11 @@
 #include <cmath>       // M_PI, std::abs, std::hypot, atan2, etc.
 #include <memory>      // std::unique_ptr, std::shared_ptr — smart pointers
 #include <string>      // std::string
+#include <unordered_map>  // std::unordered_map — per-cat mail cooldown timestamps
 #include <vector>      // std::vector — growable array
+
+// OpenCV cv::Mat is used by the image-conversion helper declared below.
+#include <opencv2/core.hpp>
 
 // ===========================================================================
 // ROS 2 message type includes
@@ -56,6 +60,10 @@
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
+// vision_msgs::msg::Detection2DArray — cat_detector_cpp's per-frame detections;
+// each box carries a generic "cat" hypothesis plus (when the per-cat classifier
+// fired) a second white/brown identity hypothesis in results[1].
+#include "vision_msgs/msg/detection2_d_array.hpp"
 
 // ===========================================================================
 // TF2 (Transform Framework) includes
@@ -148,6 +156,9 @@ private:
   void scan_cb(const sensor_msgs::msg::LaserScan::SharedPtr msg);    // LiDAR scans
   void joy_cb(const std_msgs::msg::Bool::SharedPtr msg);             // Joystick override
   void cat_detected_cb(const std_msgs::msg::Bool::SharedPtr msg);    // External cat detector
+  // cat_detector_cpp identity stream: emails a snapshot when a white/brown
+  // cat is recognized mid-patrol (see cat_recognized_* parameters).
+  void detections_cb(const vision_msgs::msg::Detection2DArray::SharedPtr msg);
   void voltage_cb(const std_msgs::msg::Float32::SharedPtr msg);      // Battery voltage
 
   // =========================================================================
@@ -171,8 +182,19 @@ private:
   // =========================================================================
   // Utility methods
   // =========================================================================
-  bool save_current_image();              // Convert ROS Image → JPEG on disk
-  void send_mail_request();               // Publish JSON mail request to mail_node
+  bool last_image_to_bgr(cv::Mat & out);  // Decode last_image_ → BGR cv::Mat (shared by the savers)
+  bool save_current_image();              // Convert ROS Image → JPEG on disk (adds to saved_paths_)
+  // Save the current camera frame to a standalone JPEG named "<tag>_<ts>.jpg"
+  // WITHOUT touching saved_paths_/frames_saved_ (those belong to the 360°
+  // capture batch). Returns the file path, or "" if no frame was saved.
+  std::string save_snapshot(const std::string & tag);
+  void send_mail_request();               // Publish JSON mail request for the 360° capture batch
+  // Publish a JSON mail request for an explicit set of attachment paths and
+  // subject — used for the single-snapshot loop-boundary and cat-recognized
+  // emails. The no-arg overload above delegates here with saved_paths_.
+  void send_mail_request(const std::vector<std::string> & paths, const std::string & subject);
+  // True while a patrol cycle is actively running (i.e. not Idle/WaitingForTf).
+  bool is_patrolling() const;
   void set_buzzer(bool on);               // Turn onboard buzzer on or off
   void play_completion_sound();           // Spawn audio player in background (no-op if path empty)
   void start_bluetooth_connect_async();   // Background: pair RX-V485, route PulseAudio, play bark
@@ -213,6 +235,7 @@ private:
   std::string mail_subject_;          // Email subject line
   std::string mail_to_;               // Email recipient
   std::string cat_detected_topic_;    // Cat detection input
+  std::string detections_topic_;      // cat_detector_cpp Detection2DArray input (white/brown identity)
   std::string patrol_pattern_name_;   // Which strategy to use ("classic" etc.)
 
   // Behavior tuning (numeric parameters from YAML)
@@ -250,6 +273,12 @@ private:
   bool start_on_boot_{true};               // Start patrolling at launch?
   bool loop_patrol_{true};                 // Auto-repeat after idle period?
   bool cat_detection_enabled_{false};      // React to cat sightings?
+  // --- Cat-recognized snapshot email (fires only during an active patrol) ---
+  bool cat_recognized_mail_enabled_{true}; // Email a snapshot on white/brown recognition?
+  double cat_recognized_min_conf_{0.6};    // Identity confidence bar before emailing
+  double cat_recognized_cooldown_sec_{30.0}; // Min seconds between emails for the SAME cat
+  // --- Loop-boundary snapshot emails (start/end of each patrol cycle) ---
+  bool loop_boundary_mail_enabled_{true};  // Email one snapshot at loop start and loop end?
   double approach_linear_{0.1};            // Cat approach speed (m/s)
   double approach_max_sec_{15.0};          // Max cat approach time (s)
   bool exit_after_one_cycle_{false};       // Shut down after one patrol?
@@ -323,6 +352,11 @@ private:
   // Cat approach phase timing
   rclcpp::Time approach_start_;
 
+  // Per-identity cooldown for the cat-recognized email: label ("white"/"brown")
+  // → time of the last snapshot emailed for that cat. Keeps one lingering
+  // sighting from emailing every inference frame.
+  std::unordered_map<std::string, rclcpp::Time> last_cat_mail_;
+
   // =========================================================================
   // FSM state and timers
   // =========================================================================
@@ -363,7 +397,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_image_sub_; // ← depth camera
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;    // ← LiDAR
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr joy_sub_;             // ← joystick
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr cat_sub_;             // ← cat detector
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr cat_sub_;             // ← cat detector (Bool)
+  rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr detections_sub_; // ← cat_detector_cpp
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr voltage_sub_;      // ← battery
 
   // =========================================================================

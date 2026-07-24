@@ -54,6 +54,18 @@ amcl:
     base_frame_id: "base_footprint"
     tf_broadcast: true     # AMCL publishes map → odom
 
+    # --- Initial pose = HOME (no RViz "2D Pose Estimate" needed) ---
+    # We always start a patrol from the same home spot, so seed AMCL there on
+    # startup instead of waiting for a manual pose in RViz. These x/y/yaw MUST
+    # match patrol_manager's home_pose ([0.331, -0.086, 0.043] on living_room_v1).
+    # RViz's 2D Pose Estimate still publishes /initialpose to override anytime.
+    set_initial_pose: true
+    initial_pose:
+      x: 0.331
+      y: -0.086
+      z: 0.0
+      yaw: 0.043
+
     # --- Recovery ---
     # Both 0.0 = no random particle injection (safe start).
     # Set recovery_alpha_fast: 0.1 if the robot gets "lost" too easily.

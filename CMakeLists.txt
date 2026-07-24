@@ -19,6 +19,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(vision_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 add_executable(patrol_node
@@ -30,7 +31,7 @@ target_include_directories(patrol_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(patrol_node
-  rclcpp geometry_msgs sensor_msgs std_msgs tf2 tf2_ros tf2_geometry_msgs cv_bridge
+  rclcpp geometry_msgs sensor_msgs std_msgs tf2 tf2_ros tf2_geometry_msgs cv_bridge vision_msgs
 )
 target_link_libraries(patrol_node ${OpenCV_LIBS})
 
@@ -50,6 +51,7 @@ install(PROGRAMS
   scripts/mail_node
   scripts/voice_node
   scripts/check_active_config.sh
+  scripts/patrol
   DESTINATION lib/${PROJECT_NAME})
 
 ament_python_install_package(${PROJECT_NAME})

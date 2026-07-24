@@ -90,6 +90,10 @@ from launch.substitutions import LaunchConfiguration
 #   - parameters: list of YAML files and/or dicts with parameter values
 #   - output: 'screen' to see stdout/stderr in the terminal
 from launch_ros.actions import Node
+# Wrap string launch-arg values so a numeric param keeps its float type
+# (a bare LaunchConfiguration reaches the node as a string and a double-typed
+# parameter like trusted_center would raise a type mismatch).
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import LogInfo
 
 
@@ -208,6 +212,42 @@ def generate_launch_description():
                     'If this is set to a frame that does not exist in /tf_static '
                     '(e.g. plain "laser"), then SLAM/AMCL/Nav2 will silently fail to '
                     'project /scan into base_link and produce empty maps.',
+    )
+
+    # --- Brain / mail toggles -----------------------------------------------
+    # The unified patrol_system.launch.py reuses this file for SENSORS + BRINGUP
+    # only, driving the robot with the Nav2 patrol_manager instead of the odom
+    # patrol_node. Set start_patrol_node:=false there so two brains never fight
+    # over /cmd_vel. mail_node is shared (both brains publish mail requests to
+    # the same topic), so it defaults on and can be disabled if launched elsewhere.
+    start_patrol_node_arg = DeclareLaunchArgument(
+        'start_patrol_node',
+        default_value='true',
+        description='Launch the odom-based patrol_node (the robots brain). '
+                    'Set false when the Nav2 patrol_manager is the brain.',
+        choices=['true', 'false'],
+    )
+    start_mail_arg = DeclareLaunchArgument(
+        'start_mail',
+        default_value='true',
+        description='Launch the Python mail_node (SMTP sender).',
+        choices=['true', 'false'],
+    )
+
+    # --- Scan front filter (/scan -> /scan_filtered) -------------------------
+    # These defaults match myscripts2/t2.5.sh: the RPLidar is mounted ~180 deg
+    # vs the URDF, so the trusted front arc is centered on pi.
+    scan_trusted_center_arg = DeclareLaunchArgument(
+        'scan_trusted_center',
+        default_value='3.141592653589793',
+        description='Bearing (rad) the trusted laser arc is centered on '
+                    '(pi = real front, given the 180 deg lidar mount).',
+    )
+    scan_trusted_halfwidth_arg = DeclareLaunchArgument(
+        'scan_trusted_halfwidth',
+        default_value='1.92',
+        description='Half-width (rad) of the trusted arc (~110 deg keeps the '
+                    'clean front 220 deg, drops the rear antenna/wire cone).',
     )
 
     # -----------------------------------------------------------------------
@@ -339,6 +379,29 @@ def generate_launch_description():
                         ('frame_id', LaunchConfiguration('lidar_frame_id')),
                     ],
                 ))
+
+            # --- Scan front filter (/scan -> /scan_filtered) ------------------
+            # AMCL and both Nav2 costmaps consume /scan_filtered, NOT /scan.
+            # The RPLidar A1 is mounted ~180 deg vs the URDF, so we KEEP the
+            # trusted front arc centered on pi (trusted_center) with half-width
+            # 1.92 rad (~110 deg) and drop the rear cone (antennas/wires that
+            # move with the robot and wreck scan matching). Matches
+            # myscripts2/t2.5.sh — WITHOUT this node, localization + obstacle
+            # avoidance get no laser at all.
+            entities.append(Node(
+                package='yahboomcar_bringup',
+                executable='scan_front_filter',
+                name='scan_front_filter',
+                output='screen',
+                parameters=[{
+                    'input_topic': '/scan',
+                    'output_topic': '/scan_filtered',
+                    'trusted_center': ParameterValue(
+                        LaunchConfiguration('scan_trusted_center'), value_type=float),
+                    'trusted_halfwidth': ParameterValue(
+                        LaunchConfiguration('scan_trusted_halfwidth'), value_type=float),
+                }],
+            ))
         else:
             entities.append(LogInfo(msg='[cat_patrol] LiDAR driver skipped (start_lidar=false)'))
 
@@ -348,32 +411,40 @@ def generate_launch_description():
         #   Values from later entries OVERRIDE earlier ones.  So params_file
         #   provides all defaults, and the dict overrides use_sim_time and
         #   start_patrol_on_boot specifically.
-        patrol_node = Node(
-            package='cat_patrol_robot',
-            executable='patrol_node',
-            name='patrol_node',
-            output='screen',
-            parameters=[
-                params_file,                    # Load all defaults from YAML
-                {
-                    'use_sim_time': LaunchConfiguration('use_sim_time'),
-                    'start_patrol_on_boot': start_patrol,
-                },
-            ],
-        )
-        entities.append(patrol_node)
+        start_patrol_node = LaunchConfiguration('start_patrol_node').perform(context).strip().lower() == 'true'
+        if start_patrol_node:
+            patrol_node = Node(
+                package='cat_patrol_robot',
+                executable='patrol_node',
+                name='patrol_node',
+                output='screen',
+                parameters=[
+                    params_file,                    # Load all defaults from YAML
+                    {
+                        'use_sim_time': LaunchConfiguration('use_sim_time'),
+                        'start_patrol_on_boot': start_patrol,
+                    },
+                ],
+            )
+            entities.append(patrol_node)
+        else:
+            entities.append(LogInfo(
+                msg='[cat_patrol] start_patrol_node=false — odom patrol_node skipped '
+                    '(Nav2 patrol_manager is the brain).'))
 
         # --- Mail node (Python, sends email with photos) ---
-        # This node sits idle until patrol_node publishes a mail request.
+        # This node sits idle until a brain publishes a mail request.
         # SMTP credentials must be set as environment variables.
-        entities.append(
-            Node(
-                package='cat_patrol_robot',
-                executable='mail_node',
-                name='mail_node',
-                output='screen',
-                parameters=[{'mail_request_topic': '/cat_patrol/mail_request'}],
-            ))
+        start_mail = LaunchConfiguration('start_mail').perform(context).strip().lower() == 'true'
+        if start_mail:
+            entities.append(
+                Node(
+                    package='cat_patrol_robot',
+                    executable='mail_node',
+                    name='mail_node',
+                    output='screen',
+                    parameters=[{'mail_request_topic': '/cat_patrol/mail_request'}],
+                ))
 
         return entities
 
@@ -394,5 +465,9 @@ def generate_launch_description():
         lidar_serial_port_arg,
         lidar_baudrate_arg,
         lidar_frame_id_arg,
+        start_patrol_node_arg,
+        start_mail_arg,
+        scan_trusted_center_arg,
+        scan_trusted_halfwidth_arg,
         OpaqueFunction(function=compose),
     ])

@@ -27,6 +27,7 @@
 #   independently of the patrol round itself.
 # =============================================================================
 
+import fcntl
 import os
 import random
 import subprocess
@@ -40,6 +41,31 @@ PREFIX_BY_LABEL = {
     'white': 'jente-',
     'brown': 'arik-',
 }
+
+# Singleton lock: only one cat_voice may run at a time. Two instances would each
+# react to the same detection and play overlapping mp3s (and each keeps its own
+# cooldown, so a lingering cat retriggers constantly). A stray instance is easy
+# to leave behind — e.g. `ros2 run ... &` then killing the wrapper orphans the
+# node. An exclusive flock is race-free and self-healing: the kernel releases it
+# automatically when the holder dies, so there is no stale-lock to clean up.
+_LOCK_PATH = '/tmp/cat_voice.singleton.lock'
+
+
+def acquire_singleton_lock():
+    """Return the held lock file object, or None if another instance holds it.
+
+    The returned object MUST stay referenced for the process lifetime — closing
+    it (or letting it be garbage-collected) releases the lock.
+    """
+    fd = open(_LOCK_PATH, 'w')
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        return None
+    fd.write(f'{os.getpid()}\n')
+    fd.flush()
+    return fd
 
 
 class VoiceNode(Node):
@@ -126,12 +152,26 @@ class VoiceNode(Node):
 
 def main():
     rclpy.init()
+    logger = rclpy.logging.get_logger('cat_voice')
+
+    # Acquire the singleton lock BEFORE building the node, so a duplicate never
+    # even creates its detections subscription (no window to play a stray line).
+    lock = acquire_singleton_lock()
+    if lock is None:
+        logger.error(
+            f'another cat_voice instance already holds {_LOCK_PATH}; exiting to '
+            f'avoid overlapping playback')
+        rclpy.shutdown()
+        return
+
     node = VoiceNode()
     try:
         rclpy.spin(node)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+        lock.close()  # release the singleton lock
 
 
 if __name__ == '__main__':
